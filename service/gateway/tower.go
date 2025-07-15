@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -218,7 +219,37 @@ func (t *FireTower) bindTopic(topic []string) ([]string, error) {
 	var (
 		addTopic []string
 	)
+	if t == nil {
+		return addTopic, errors.New("t is nil")
+	}
+	if TM == nil {
+		return addTopic, errors.New("TM is nil")
+	}
+	if topicManageGrpc == nil {
+		return addTopic, errors.New("topicManageGrpc is nil")
+	}
+	if topicManage == nil {
+		return addTopic, errors.New("topicManage is nil")
+	}
+	if topicManage.Conn == nil {
+		return addTopic, errors.New("topicManage.Conn is nil")
+	}
+	if topicManage.Conn.LocalAddr() == nil {
+		return addTopic, errors.New("topicManage.Conn.LocalAddr() is nil")
+	}
+	if topicManage.Conn.LocalAddr().Network() == "" {
+		return addTopic, errors.New("topicManage.Conn is nil")
+	}
+	if topicManage.Conn.LocalAddr().String() == "" {
+		return addTopic, errors.New("topicManage.Conn is nil")
+	}
+	if t.topic == nil {
+		t.topic = make(map[string]bool)
+	}
 	bucket := TM.GetBucket(t)
+	if bucket == nil {
+		return addTopic, errors.New("bucket is nil")
+	}
 	for _, v := range topic {
 		if _, ok := t.topic[v]; !ok {
 			addTopic = append(addTopic, v) // 待订阅的topic
