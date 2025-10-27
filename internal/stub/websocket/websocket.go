@@ -4,12 +4,17 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"time"
 )
+
+var errConnClosed = errors.New("websocket: connection closed")
 
 // Message type constants compatible with gorilla/websocket.
 const (
-	TextMessage   = 1
-	BinaryMessage = 2
+	TextMessage        = 1
+	BinaryMessage      = 2
+	CloseNormalClosure = 1000
+	CloseGoingAway     = 1001
 )
 
 // Conn is a lightweight stand-in for a gorilla websocket connection. It only
@@ -28,7 +33,7 @@ func (c *Conn) WriteMessage(messageType int, data []byte) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		return errors.New("websocket: connection closed")
+		return errConnClosed
 	}
 	// The stub ignores the messageType and simply stores the payload. The
 	// real gorilla/websocket library would write the frame to the network.
@@ -43,10 +48,17 @@ func (c *Conn) ReadMessage() (int, []byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
-		return TextMessage, nil, errors.New("websocket: connection closed")
+		return TextMessage, nil, errConnClosed
 	}
 	data := append([]byte(nil), c.payload...)
 	return TextMessage, data, nil
+}
+
+// SetWriteDeadline is a no-op for the stub but preserves API compatibility
+// with gorilla/websocket so the production code can compile and tests can run
+// offline.
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	return nil
 }
 
 // Close marks the stub connection as closed.
@@ -71,4 +83,17 @@ func (u *Upgrader) Upgrade(w http.ResponseWriter, r *http.Request, responseHeade
 		}
 	}
 	return &Conn{}, nil
+}
+
+// IsCloseError mirrors the signature of gorilla/websocket.IsCloseError while
+// providing a conservative implementation suitable for offline tests.
+func IsCloseError(err error, codes ...int) bool {
+	if err == nil {
+		return false
+	}
+	// The stub treats the shared errConnClosed sentinel as the signal that
+	// a close frame was observed. This mirrors the behaviour that matters to
+	// our gateway code without depending on the full gorilla/websocket
+	// implementation.
+	return errors.Is(err, errConnClosed)
 }
