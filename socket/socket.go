@@ -212,9 +212,15 @@ func (t *TcpClient) OnPush(fn func(message *SendMessage)) {
 		for {
 			message, err := t.Read()
 			if err != nil {
-				message.Panic(err.Error())
-				// 只可能是连接断开了
-				return
+				// 连接可能已经断开，等待重连后继续消费
+				if message != nil {
+					message.Panic(err.Error())
+				} else {
+					fmt.Println("[manager client] read error:", err)
+				}
+				// 如果底层正在执行自动重连，则等待并重试
+				time.Sleep(time.Second)
+				continue
 			}
 			fn(message)
 		}
