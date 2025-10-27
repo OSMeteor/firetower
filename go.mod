@@ -3,14 +3,14 @@ module github.com/OSMeteor/firetower
 go 1.12
 
 require (
-        github.com/golang/protobuf v0.0.0
-        github.com/gorilla/websocket v0.0.0
-        github.com/holdno/snowFlakeByGo v0.0.0
-        github.com/json-iterator/go v0.0.0
-        github.com/pelletier/go-toml v0.0.0
-        github.com/pkg/errors v0.0.0
-        golang.org/x/net v0.0.0
-        google.golang.org/grpc v0.0.0
+github.com/golang/protobuf v0.0.0-00010101000000-000000000000
+github.com/gorilla/websocket v0.0.0-00010101000000-000000000000
+github.com/holdno/snowFlakeByGo v0.0.0-00010101000000-000000000000
+github.com/json-iterator/go v0.0.0-00010101000000-000000000000
+github.com/pelletier/go-toml v0.0.0-00010101000000-000000000000
+github.com/pkg/errors v0.0.0-00010101000000-000000000000
+golang.org/x/net v0.0.0-00010101000000-000000000000
+google.golang.org/grpc v0.0.0-00010101000000-000000000000
 )
 
 replace github.com/json-iterator/go => ./internal/stub/jsoniter
