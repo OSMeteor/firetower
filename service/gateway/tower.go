@@ -202,6 +202,7 @@ func (t *FireTower) Run() {
 	// 读取websocket信息
 	go t.readLoop()
 	// 处理读取事件
+	// 这两个协程都依赖 closeChan，在连接断开或被 Close 触发时会自动退出，避免 goroutine 泄漏
 	go t.readDispose()
 
 	if t.onConnectHandler != nil {
