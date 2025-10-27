@@ -410,7 +410,12 @@ func (t *FireTower) readDispose() {
 	for {
 		fire, err := t.read()
 		if err != nil {
-			fire.Panic(fmt.Sprintf("read message failed:%v", err))
+			if fire != nil {
+				fire.Panic(fmt.Sprintf("read message failed:%v", err))
+				fire.Recycling()
+			} else {
+				towerLog(t, "ERROR", fmt.Sprintf("read message failed:%v", err))
+			}
 			t.Close()
 			return
 		} else if t.isClose {
