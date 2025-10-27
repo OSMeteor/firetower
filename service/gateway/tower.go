@@ -294,8 +294,15 @@ func (t *FireTower) read() (*FireInfo, error) {
 	if t.isClose {
 		return nil, ErrorClose
 	}
-	message := <-t.readIn
-	return message, nil
+	select {
+	case message, ok := <-t.readIn:
+		if !ok {
+			return nil, ErrorClose
+		}
+		return message, nil
+	case <-t.closeChan:
+		return nil, ErrorClose
+	}
 }
 
 // Send 发送消息方法
