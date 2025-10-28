@@ -202,6 +202,7 @@ func (t *FireTower) Run() {
 	// 读取websocket信息
 	go t.readLoop()
 	// 处理读取事件
+	// 这两个协程都依赖 closeChan，在连接断开或被 Close 触发时会自动退出，避免 goroutine 泄漏
 	go t.readDispose()
 
 	if t.onConnectHandler != nil {
@@ -294,18 +295,37 @@ func (t *FireTower) read() (*FireInfo, error) {
 	if t.isClose {
 		return nil, ErrorClose
 	}
-	message := <-t.readIn
-	return message, nil
+	select {
+	case message, ok := <-t.readIn:
+		if !ok {
+			return nil, ErrorClose
+		}
+		return message, nil
+	case <-t.closeChan:
+		return nil, ErrorClose
+	}
 }
 
 // Send 发送消息方法
 // 向某个topic发送某段信息
 func (t *FireTower) Send(message *socket.SendMessage) error {
+	if message == nil {
+		return errors.New("send message is nil")
+	}
 	if t.isClose {
 		return ErrorClose
 	}
-	t.sendOut <- message
-	return nil
+	timer := time.NewTimer(3 * time.Second)
+	defer timer.Stop()
+
+	select {
+	case t.sendOut <- message:
+		return nil
+	case <-t.closeChan:
+		return ErrorClose
+	case <-timer.C:
+		return socket.ErrorBlock
+	}
 }
 
 // Close 关闭客户端连接并注销
@@ -343,14 +363,27 @@ func (t *FireTower) Close() {
 
 func (t *FireTower) sendLoop() {
 	heartTicker := time.NewTicker(time.Duration(ConfigTree.Get("heartbeat").(int64)) * time.Second)
+	defer heartTicker.Stop()
 	for {
 		select {
 		case message := <-t.sendOut:
+			if message == nil {
+				towerLog(t, "ERROR", "sendLoop received nil message")
+				continue
+			}
+			if err := t.ws.SetWriteDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				message.Panic(fmt.Sprintf("set write deadline failed: %v", err))
+				goto collapse
+			}
 			if message.MessageType == 0 {
 				message.MessageType = 1 // 文本格式
 			}
 			if err := t.ws.WriteMessage(message.MessageType, []byte(message.Data)); err != nil {
-				message.Panic(err.Error())
+				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					message.Info(fmt.Sprintf("websocket closed while sending: %v", err))
+				} else {
+					message.Panic(err.Error())
+				}
 				goto collapse
 			}
 		case <-heartTicker.C:
@@ -358,10 +391,10 @@ func (t *FireTower) sendLoop() {
 			sendMessage.MessageType = websocket.TextMessage
 			sendMessage.Data = []byte{104, 101, 97, 114, 116, 98, 101, 97, 116} // []byte("heartbeat")
 			if err := t.Send(sendMessage); err != nil {
+				sendMessage.Panic(fmt.Sprintf("heartbeat send failed: %v", err))
 				goto collapse
 			}
 		case <-t.closeChan:
-			heartTicker.Stop()
 			return
 		}
 	}
@@ -410,7 +443,12 @@ func (t *FireTower) readDispose() {
 	for {
 		fire, err := t.read()
 		if err != nil {
-			fire.Panic(fmt.Sprintf("read message failed:%v", err))
+			if fire != nil {
+				fire.Panic(fmt.Sprintf("read message failed:%v", err))
+				fire.Recycling()
+			} else {
+				towerLog(t, "ERROR", fmt.Sprintf("read message failed:%v", err))
+			}
 			t.Close()
 			return
 		} else if t.isClose {
