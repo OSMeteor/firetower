@@ -25,6 +25,14 @@ Firetower 是一个围绕 Topic 发布/订阅模型打造的分布式推送服�
   - **推送协调层**：对 TCP 推送通道做多活部署时，可将 `ConnectBucket` 封装为共享的协调层，利用消息队列或内部 RPC 将 `Publish` 请求分发到各个在线 Manager 连接上，保证每个 Gateway 仅接受一份数据。
   - **故障切换**：结合现有心跳与清理逻辑（`service/manager/manager.go` 中的 `checkHeartBeat`），为每个状态节点设置健康检测与自动主备切换策略；当节点不可用时，从共享存储恢复订阅索引并重建与 Gateway 的长连。
 
+#### Bucket 扩容策略（面向 5k～10k 订阅者）
+- **配置入口**：`config/fireTower.toml` 中的 `[bucket]` 配置块控制 `Num`（Bucket 个数）、`BuffChanCount`（每个 Bucket 的推送队列容量）与 `ConsumerNum`（每个 Bucket 并发执行 `consumer` 的 goroutine 数量）。`buildBuckets` 会在 Gateway 启动时依据这些参数构建 `TowerManager.bucket`，并为每个 Bucket 预启动 `ConsumerNum` 个消费者。调高 `Num` 会直接增加 Gateway 侧的并发推送通道数，适合大群场景下横向切分连接负载。实现位于 `service/gateway/bucket.go`。 
+- **扩容原理**：`TowerManager.GetBucket` 依据连接自增的 `connId` 对 Bucket 数量取模，从而将同一实例的 WebSocket 连接均匀分布到不同 Bucket。每条消息先进入中心通道 `centralChan`，再被广播到全部 Bucket 的 `BuffChan`。增大 Bucket 数量意味着在 fan-out 阶段存在更多 goroutine 并行遍历 `topic -> connection` 映射，单个 Bucket 需要处理的订阅列表缩短，从而降低 5k+ 订阅者聚集时的遍历时间和写 socket 的尾延迟。 
+- **配套调优建议**：
+  - 随着 Bucket 数量增加，应同步放大 `CentralChanCount` 和每个 Bucket 的 `BuffChanCount`，避免高并发下消息在中心或分桶队列堆积。
+  - 若单 Bucket 的 `consumer` goroutine 仍成为瓶颈，可提高 `ConsumerNum`（默认 32）让每个 Bucket 拥有更多并发写出线程；同时确保业务服务器的 `ulimit -n`、CPU 核心数与 Go 调度器参数匹配，防止上下文切换成本过高。
+  - 对于超大 Topic，可结合 Bucket 扩容与业务层的 Topic 拆分（例如基于用户 hash 拆成多个子 Topic），进一步减少单 Bucket 内的订阅数。
+
 #### 大群场景的瓶颈评估（5k～10k 订阅者）
 - **Gateway 内部 Fan-out 并发**：单个 Gateway 推送链路核心依赖 `TowerManager.centralChan` 将消息复制到所有 Bucket，随后每个 Bucket 顺序遍历本地 `topic -> connection` 列表并调用连接的 `Send`。在 5k+ 连接聚集于同一 Topic 时，热点 Bucket 的顺序遍历与 `sendLoop` 单 goroutine 写回会放大尾延迟，可通过增加 Bucket 数量、开启 `sendLoop` 批量写入或在业务层拆分 Topic 缓解。实现位置：`service/gateway/tower_manager.go`、`service/gateway/tower_send.go`。
 - **Manager → Gateway 广播**：Manager 在 `topic_manage_service.go` 中逐个 TCP 连接写入封包，若该 Topic 订阅扩散到多台 Gateway，则单个 `Publish` 需要串行写多个连接。需要关注 Manager 进程的 CPU 与网络带宽，可通过多进程横向扩容、分片 Topic 或者为热点 Topic 建立专门的推送协程池提升吞吐。
