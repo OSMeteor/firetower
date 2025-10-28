@@ -30,7 +30,7 @@ Firetower 是一个围绕 Topic 发布/订阅模型打造的分布式推送服�
 - **扩容原理**：`TowerManager.GetBucket` 依据连接自增的 `connId` 对 Bucket 数量取模，从而将同一实例的 WebSocket 连接均匀分布到不同 Bucket。每条消息先进入中心通道 `centralChan`，再被广播到全部 Bucket 的 `BuffChan`。增大 Bucket 数量意味着在 fan-out 阶段存在更多 goroutine 并行遍历 `topic -> connection` 映射，单个 Bucket 需要处理的订阅列表缩短，从而降低 5k+ 订阅者聚集时的遍历时间和写 socket 的尾延迟。 
 - **配套调优建议**：
   - 随着 Bucket 数量增加，应同步放大 `CentralChanCount` 和每个 Bucket 的 `BuffChanCount`，避免高并发下消息在中心或分桶队列堆积。
-  - 若单 Bucket 的 `consumer` goroutine 仍成为瓶颈，可提高 `ConsumerNum`（默认 32）让每个 Bucket 拥有更多并发写出线程；同时确保业务服务器的 `ulimit -n`、CPU 核心数与 Go 调度器参数匹配，防止上下文切换成本过高。
+  - 若单 Bucket 的 `consumer` goroutine 仍成为瓶颈，可提高 `ConsumerNum`（默认 32）让每个 Bucket 拥有更多并发写出线程；32 这一初始值大致匹配 8 核 CPU。针对 5k～10k 人的大群，可按“`CPU 核心数 * 2`”的上限逐步压测到 48 或 64，并在监控中确认 `consumer` Goroutine 的平均推送耗时与系统负载保持在可控范围。
   - 对于超大 Topic，可结合 Bucket 扩容与业务层的 Topic 拆分（例如基于用户 hash 拆成多个子 Topic），进一步减少单 Bucket 内的订阅数。
 
 #### 大群场景的瓶颈评估（5k～10k 订阅者）
