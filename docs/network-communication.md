@@ -13,11 +13,11 @@
 
 ## 2. 订阅关系同步
 1. **本地索引**：`service/gateway/tower_manager.go` 中的 `bindTopic` 会在连接所属的 `Bucket` 中新增 `topic -> connection` 关系，确保实例内部的推送可以快速定位目标连接。
-2. **Manager 登记**：Gateway 通过 gRPC `SubscribeTopic` 接口，将待订阅 Topic 与当前 Gateway 的 TCP 地址（`topicManage.Conn.LocalAddr()`）一起上报给 Manager；退订流程调用 `UnSubscribeTopic`。
+2. **Manager 登记**：Gateway 通过 gRPC `SubscribeTopic` 接口（默认访问 `[grpc].address` 指定的 `6667` 端口），将待订阅 Topic 与当前 Gateway 的 TCP 地址（`topicManage.Conn.LocalAddr()`）一起上报给 Manager；退订流程调用 `UnSubscribeTopic`。
 3. **异常处理**：若 gRPC 调用失败，则关闭当前连接，避免出现 Manager 与 Gateway 订阅状态不一致的问题。
 
 ## 3. 消息发布与分发
-1. **业务发布**：业务层在 `readHandler` 中调用 `Publish`，由 Gateway 通过 TCP 客户端 `topicManage.Publish` 将消息发送给 Manager。发送内容包含消息 ID、来源、Topic 以及数据正文。
+1. **业务发布**：业务层在 `readHandler` 中调用 `Publish`，由 Gateway 通过 TCP 客户端 `topicManage.Publish` 将消息发送给 Manager（默认连接 `topicServiceAddr` 所指的 `6666` 端口）。发送内容包含消息 ID、来源、Topic 以及数据正文。
 2. **Manager 广播**：`service/manager/topic_manage_service.go` 的 gRPC `Publish` 接口收到请求后，查找 Topic 订阅列表，将消息封包为自定义协议，通过 TCP 连接写回到所有登记的 Gateway。
 3. **Gateway 推送**：Gateway 侧 `TowerManager` 的中心通道 (`centralChan`) 接到 Manager 推送的 `SendMessage` 后，会将消息复制到每个 `Bucket`。Bucket 遍历本地订阅表，调用连接的 `Send` 将消息写入 WebSocket。
 4. **客户端接收**：WebSocket 连接通过 `sendLoop` 将消息发送给客户端；若连接在过程中断开，Gateway 会触发清理逻辑并通知 Manager 取消订阅。
@@ -27,6 +27,6 @@
 
 ## 5. 心跳与故障恢复
 - **Gateway 心跳**：`sendLoop` 定期发送 `heartbeat` 文本帧；异常时会触发连接关闭并清理资源。
-- **Manager 心跳**：TCP 服务端在 `connectBucket.heartbeat` 中每 10 秒向 Gateway 写入心跳包；写入失败即关闭连接并移除订阅关系，确保拓扑内的僵尸连接被及时回收。
+- **Manager 心跳**：TCP 服务端在 `connectBucket.heartbeat` 中每 10 秒向 Gateway 写入心跳包；写入失败即关闭连接并移除订阅关系，确保拓扑内的僵尸连接被及时回收。该 TCP 通道与 `topicServiceAddr` 配置的 `6666` 端口对应。
 
 通过以上协作流程，Firetower 在无需外部消息队列的情况下完成了从客户端消息生产、订阅登记到多实例广播的完整链路。

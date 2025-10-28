@@ -14,6 +14,7 @@ Firetower 是一个围绕 Topic 发布/订阅模型打造的分布式推送服�
 - **订阅关系中心**：`service/manager/topic_manage_service.go` 使用 gRPC 暴露 `SubscribeTopic`、`UnSubscribeTopic` 和 `CheckTopicExist` 等接口，将每个 Topic 与发起订阅的 Gateway 节点 IP 建立映射，并记录订阅计数。
 - **推送总线**：收到 gRPC `Publish` 调用后，Manager 会封包消息并通过长连 TCP 通道广播给所有注册的 Gateway；`service/manager/connect_bucket.go` 中的 TCP 服务端负责接收来自 Gateway 的推送请求，并可按用户或 Topic 做离线清理。
 - **运行时观测**：内置 HTTP Dashboard，可按 Topic 返回订阅量等运行时指标，便于监控与排障。
+- **对外端口**：默认监听两个端口——`6666` 用于 Gateway 通过 TCP 建立长连接执行推送与心跳，`6667` 暴露 gRPC 服务给业务或 Gateway 发起订阅、退订与发布请求；两者分别在 `config/fireTower.toml` 的 `topicServiceAddr` 和 `[grpc].address` 中配置。
 - **水平扩展策略**：当单个 Manager 无法满足大型业务的吞吐或可用性要求时，可按以下步骤演进：
   - **拆分读写职责**：保留现有 TCP 推送与 `topicRelevance` 维护逻辑（`service/manager/topic_relevance.go`），将 gRPC 面向业务的 `Publish`/`SubscribeTopic` 请求放置在多个前端进程上，通过一致性哈希或 `ClusterId` 划分把操作路由到对应的状态节点。
   - **共享状态存储**：引入诸如 Redis、TiKV 等外部存储保存 Topic→Gateway 映射，Manager 状态节点只缓存热点数据，定期或在连接掉线时回写；需确保订阅登记与 TCP 广播之间具备幂等或事务保障，避免重复推送。

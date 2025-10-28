@@ -3,10 +3,10 @@
 chanLens = 1000 # channal 缓冲区大小
 heartbeat = 600 # 心跳间隔 单位秒(s)
 
-topicServiceAddr = "0.0.0.0:6666"
+topicServiceAddr = "0.0.0.0:6666" # Manager TCP 推送/心跳服务监听地址
 
 [grpc]
-address = "localhost:6667"
+address = "localhost:6667" # Manager gRPC API 地址（订阅、退订、发布入口）
 
 [bucket]
 Num = 4 # 启动多少个Bucket
