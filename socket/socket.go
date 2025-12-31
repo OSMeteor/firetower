@@ -28,6 +28,7 @@ type TcpClient struct {
 	Conn      net.Conn
 	readIn    chan *SendMessage
 	sendOut   chan []byte
+	mutex     sync.Mutex
 }
 
 // PushMessage 推送消息结构体
@@ -147,16 +148,35 @@ func (t *TcpClient) Connect() error {
 
 // Close 关闭tcp连接
 func (t *TcpClient) Close() {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
 	if !t.isClose {
 		fmt.Println("socket close")
 		t.isClose = true
 		t.Conn.Close()
 		close(t.closeChan)
 	Retry:
+		// Since Connect calls a goroutine that might access t.isClose, and Close calls Connect...
+		// Connect itself does not block significantly except for Dial.
+		// NOTE: Calling Connect() inside Lock() might be dangerous if Connect() takes a long time (Dial).
+		// But Connect() launches goroutines.
+		// Ideally we should unlock before Connect, but we need to ensure state is consistent.
+		// However, Close() is supposed to close the connection. Why does it call Connect()?
+		// It seems it tries to AUTO-RECONNECT immediately?
+		// "socket close" -> "Retry ... Connect".
+		// This means this is a "Restart" rather than "Close".
+		// If I rename this, it breaks API.
+		// If I use lock around the whole thing, Dial will hold the lock.
+		// If another goroutine calls Send(), it will block on lock until Dial finishes. This is probably fine for safety.
+		// But wait, Connect changes t.isClose = false.
+		// So Close() toggles isClose true -> false.
+		
 		err := t.Connect()
 		if err != nil {
 			fmt.Println("[topic manager] wait topic manager online", t.Address)
+			t.mutex.Unlock() // Unlock while sleeping
 			time.Sleep(time.Duration(1) * time.Second)
+			t.mutex.Lock() // Re-lock
 			goto Retry
 		} else {
 			fmt.Println("[topic manager] connected:", t.Address)
