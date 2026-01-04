@@ -71,9 +71,9 @@ func Websocket(w http.ResponseWriter, r *http.Request) {
 		}
 	})
 
-	tower.SetBeforeSubscribeHandler(func(context *gateway.FireLife, topic []string) bool {
+	tower.SetBeforeSubscribeHandler(func(context *gateway.FireLife, topic []string) ([]string, bool) {
 		// 这里用来判断当前用户是否允许订阅该topic
-		return true
+		return topic, true
 	})
 
 	tower.SetSubscribeHandler(func(context *gateway.FireLife, topic []string) bool {

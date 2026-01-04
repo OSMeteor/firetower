@@ -137,7 +137,7 @@ type FireTower struct {
 	readTimeoutHandler     func(*FireInfo)
 	subscribeHandler       func(context *FireLife, topic []string) bool
 	unSubscribeHandler     func(context *FireLife, topic []string) bool
-	beforeSubscribeHandler func(context *FireLife, topic []string) bool
+	beforeSubscribeHandler func(context *FireLife, topic []string) ([]string, bool)
 	onSystemRemove         func(topic string)
 }
 
@@ -474,8 +474,10 @@ func (t *FireTower) readDispose() {
 			case "subscribe": // 客户端订阅topic
 				addTopic := strings.Split(fire.Message.Topic, ",")
 				// 如果设置了订阅前触发事件则调用
+				// 如果设置了订阅前触发事件则调用
 				if t.beforeSubscribeHandler != nil {
-					ok := t.beforeSubscribeHandler(fire.Context, addTopic)
+					var ok bool
+					addTopic, ok = t.beforeSubscribeHandler(fire.Context, addTopic)
 					if !ok {
 						continue
 					}
@@ -577,7 +579,7 @@ func (t *FireTower) SetUnSubscribeHandler(fn func(context *FireLife, topic []str
 
 // SetBeforeSubscribeHandler 订阅前回调事件
 // 用户订阅topic前触发
-func (t *FireTower) SetBeforeSubscribeHandler(fn func(context *FireLife, topic []string) bool) {
+func (t *FireTower) SetBeforeSubscribeHandler(fn func(context *FireLife, topic []string) ([]string, bool)) {
 	t.beforeSubscribeHandler = fn
 }
 

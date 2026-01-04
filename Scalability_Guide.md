@@ -1,6 +1,6 @@
 # Firetower 系统扩展方案与架构演进 (Scalability Guide)
 
-本文档详细阐述了 Firetower 系统如何从**单机 Demo** 演进到 **亿级并发 (Uber-Scale)** 的全链路扩展方案。
+本文档详细阐述了 Firetower 系统如何从**单机 Demo** 演进到 **亿级并发 (Uber-Scale)** 的全链路扩展方案。重点包含**Topic分片 (Topic Sharding)** 和 **用户分桶 (User Bucketing)** 两大核心策略的具体实施指南。
 
 ---
 
@@ -23,8 +23,8 @@ Firetower 采用 **控制面 (Control Plane)** 与 **数据面 (Data Plane)** �
     *   **配置**: Gateway 配置文件中硬编码指向唯一的 TM IP。
 *   **特性**: 部署简单，成本最低。但存在 TM 单点故障风险。
 
-### 2. 阶段二：哈希分片集群 (Sharding Cluster) -> *推荐生产环境起步配置*
-*   **适用场景**: 5万 ~ 100万 在线用户。
+### 2. 阶段二：哈希分片集群 (Topic Sharding) -> *推荐生产环境起步配置*
+*   **适用场景**: 5万 ~ 100万 在线用户，Topic 数量庞大（如百万个不同的聊天群）。
 *   **痛点解决**: 单台 TM 的 CPU 和锁竞争成为瓶颈。
 *   **架构改造**:
     *   **TM 集群**: 部署 3~5 台 TM。
@@ -43,7 +43,7 @@ Firetower 采用 **控制面 (Control Plane)** 与 **数据面 (Data Plane)** �
     *   **TM**: 启动时自动注册 IP 到 Etcd。
     *   **Gateway**: 启动时 Watch Etcd，动态更新本地 TM 列表和 Hash 环，实现**无感扩容**。
 
-### 4. 阶段四：超级热点分桶 (Bucketing for Hot-Spots)
+### 4. 阶段四：超级热点分桶 (User Bucketing)
 *   **适用场景**: 单个 Topic（如春晚红包、顶流直播）在线人数 > 200万。
 *   **痛点解决**: 某个 Topic 过于火爆，导致其归属的那台 TM 网卡被打爆。即使有 Hash 分片，单点压力依然过大。
 *   **架构改造 (业务层介入)**:
@@ -54,13 +54,82 @@ Firetower 采用 **控制面 (Control Plane)** 与 **数据面 (Data Plane)** �
 
 ---
 
-## 组件通信与职责 (Component Roles)
+## 代码落地指南 (Implementation Guide)
 
-| 组件 | 角色 | 存储数据 | 关键职责 | 扩容方式 |
-| :--- | :--- | :--- | :--- | :--- |
-| **Gateway** | **接入层** (数据面) | `Connection Map`: 本机所有 WebSocket 连接<br>`TM List`: 下游 TM 集群列表 | 维持海量长连接、协议转换、**Hash 路由** | **无限水平扩展**<br>(加机器即可) |
-| **TopicManager** | **逻辑层** (控制面) | `Subscription Map`: 全局 Topic -> Gateway IP 映射表 | 维护订阅关系、消息分发路由 | **Hash 分片扩容**<br>(需 Gateway 配合路由) |
-| **Etcd** | **注册中心** | `MetaData`: TM 节点列表及状态 | 服务发现、故障检测 | 集群化部署 |
+本节指导开发者如何修改现有的 Firetower 代码以实现上述扩展。
+
+### 1. 实现 Topic 分片 (Sharding)
+
+**目标**: 让 Gateway 根据 Topic 名称自动选择对应的 TopicManager。
+
+**修改文件**: `service/gateway/tower.go`
+
+1.  **修改数据结构**:
+    *   将 `FireTower` 结构体中的 `topicManage` 和 `topicManageGrpc` 字段，从单个 Client 修改为 `Map` 或 `HashRing`。
+    ```go
+    type FireTower struct {
+        // ...
+        // topicManage     *socket.TcpClient  // OLD
+        // topicManageGrpc pb.TopicServiceClient // OLD
+        
+        tmRing    *一致性哈希环           // NEW: 用于计算 Hash
+        tmClients map[string]*socket.TcpClient // NEW: IP -> TcpClient 映射
+        // ...
+    }
+    ```
+
+2.  **修改 `bindTopic` / `unbindTopic` 方法**:
+    *   在订阅前，计算 Topic 的哈希值，找到对应的 TM 节点。
+    ```go
+    func (t *FireTower) bindTopic(topics []string) {
+        // Group topics by TM node to reduce network calls
+        topicsByNode := make(map[string][]string)
+        for _, topic := range topics {
+            nodeIP := t.tmRing.GetNode(topic)
+            topicsByNode[nodeIP] = append(topicsByNode[nodeIP], topic)
+        }
+        
+        // Batch subscribe to each node
+        for ip, subTopics := range topicsByNode {
+            client := t.tmClients[ip]
+            client.Subscribe(subTopics)
+            // ... grpc call ...
+        }
+    }
+    ```
+
+### 2. 实现热点分桶 (Bucketing)
+
+**目标**: 将超大 Topic 拆分为多个小 Topic。由于我们已经实现了 Middleware 机制，**这一步可以在业务层完成，无需修改 Firetower 核心代码！**
+
+**实现位置**: 业务层初始化 Gateway 时 (如 `main.go`)。
+
+**代码示例**:
+利用 `SetBeforeSubscribeHandler` 钩子函数动态重写 Topic 名称。
+
+```go
+tower := gateway.BuildTower(wsConn, nil)
+
+// 设置订阅前钩子
+tower.SetBeforeSubscribeHandler(func(ctx *gateway.FireLife, topics []string) bool {
+    var newTopics []string
+    for _, topic := range topics {
+        // 假设 "live_stream" 是超级热点
+        if topic == "live_stream" {
+            // 根据用户ID计算 Hash 桶 (0-99)
+            bucketID := hash(ctx.UserId) % 100
+            // 订阅到具体的子桶: live_stream_42
+            newTopics = append(newTopics, fmt.Sprintf("%s_%d", topic, bucketID))
+        } else {
+            newTopics = append(newTopics, topic)
+        }
+    }
+    // 修改待订阅列表 (注意：这里需要 tower 源码支持修改入参，或者返回新的列表)
+    // 建议修改 SetBeforeSubscribeHandler 签名使其能返回 []string
+    return true
+})
+```
+*注：发布端(Producer)也需要做相应改造，向所有 Bucket (`live_stream_0` 到 `live_stream_99`) 群发消息。*
 
 ---
 
@@ -80,17 +149,6 @@ Firetower 采用 **控制面 (Control Plane)** 与 **数据面 (Data Plane)** �
         *   **踢人**: `Unsubscribe(User)`
         *   **监控**: `GetTopicStatus(Topic)`
         *   **健康检查**: `Ping()`
-
----
-
-## 开发者调用指南
-
-*   **我要给用户发消息 (Push)**: 
-    *   请连接 **Gateway** (WebSocket/TCP)。
-    *   Gateway 会自动帮你路由到正确的 TM，性能最高。
-*   **我要踢人/查状态 (Control)**: 
-    *   请连接 **TM** (gRPC :6667)。
-    *   这是修改全局状态的唯一入口。
 
 ---
 

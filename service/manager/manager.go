@@ -296,6 +296,12 @@ func (c *connectBucket) close() {
 }
 
 func (c *connectBucket) handler() {
+	defer func() {
+		if err := recover(); err != nil {
+			Logger("PANIC", fmt.Sprintf("handler panic: %v", err))
+			c.close()
+		}
+	}()
 	for {
 		var buffer = make([]byte, 1024*16)
 		l, err := c.conn.Read(buffer)
@@ -311,6 +317,12 @@ func (c *connectBucket) handler() {
 }
 
 func (c *connectBucket) sendLoop() {
+	defer func() {
+		if err := recover(); err != nil {
+			Logger("PANIC", fmt.Sprintf("sendLoop panic: %v", err))
+			c.close()
+		}
+	}()
 	for {
 		select {
 		case message := <-c.packetChan:
@@ -346,6 +358,12 @@ func (c *connectBucket) sendLoop() {
 }
 
 func (c *connectBucket) heartbeat() {
+	defer func() {
+		if err := recover(); err != nil {
+			Logger("PANIC", fmt.Sprintf("heartbeat panic: %v", err))
+			c.close()
+		}
+	}()
 	t := time.NewTicker(10 * time.Second)
 	// 心跳包内容固定 所以只用封包一次 直接用封好的包发送就可以了
 	// 服务器间心跳时间应该短一些，以便及时获取连接状态
