@@ -13,6 +13,12 @@
 - **Topic Manager 守护机制**: 在 `TopicManager` 的所有后台协程 (`handler`, `sendLoop`, `heartbeat`) 中也增加了 `defer recover`，防止单连接处理异常导致整个节点服务崩溃 (P0级风险修复)。
 - **构建修复**: 解决了 `socket/socket.go` 和 `service/gateway/tower.go` 中的合并冲突，统一了代码版本。
 
+### API 变更 (API Breaking Changes)
+- **SetBeforeSubscribeHandler 签名升级**:
+  - **旧**: `func(ctx, topic) bool`
+  - **新**: `func(ctx, topic) ([]string, bool)`
+  - **目的**: 支持**中间件模式**，允许在订阅前动态修改 Topic 名称（如实现热点分桶）。旧代码需更新返回值。
+
 ### 架构重构 (Refactoring)
 - **内存管理简化**: 移除了针对小对象 (`FireInfo`, `FireTower`) 的 `sync.Pool`。利用 Go 1.18+ Runtime 优秀的 GC 能力，直接使用堆/栈分配。这消除了“Use-after-free”和“Double-free”导致的崩溃风险，且在基准测试中性能损耗仅 <6%，极大提升了代码稳定性和安全性。
 

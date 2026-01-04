@@ -99,9 +99,10 @@ tower.SetReadTimeoutHandler(func(fire *gateway.FireInfo) {
 
 - BeforeSubscribeHandler 客户端订阅某些topic时触发(这个时候topic还没有订阅，是before subscribe)
 ``` golang
-tower.SetBeforeSubscribeHandler(func(context *gateway.FireLife, topic []string) bool {
+tower.SetBeforeSubscribeHandler(func(context *gateway.FireLife, topic []string) ([]string, bool) {
     // 这里用来判断当前用户是否允许订阅该topic
-    return true
+    // 也可以在这里修改 topic 列表实现热点分桶
+    return topic, true
 })
 ```
 
