@@ -9,6 +9,8 @@
 - **空指针防御 (Nil Pointer Protection)**: 在 `service/gateway/tower.go` 中增加了防御性检查，确保从对象池获取的 `FireInfo` 及其成员永不为 nil。
 - **防止队头阻塞 (Head-of-Line Blocking)**: 这是一个 **P0** 级修复。修改了 `FireTower.Send` 为非阻塞模式 (`select + default`)。如果客户端接收缓冲慢或满，服务端将主动丢弃消息并记录日志，防止拖死整个 Bucket 的广播分发。
 - **指数退避重连 (Exponential Backoff)**: 实现了 TCP 和 gRPC 的指数退避策略 (1s -> 30s)，防止后端服务故障时大量 Gateway 发起连接风暴。
+- **Topic Manager 竞态条件修复**: 在 `service/manager/manager.go` 中修复了 `SubscribeTopic` 和 `UnSubscribeTopic` 无法安全并发访问订阅列表导致的 Panic 问题。引入了互斥锁 (`Mutex`) 保护共享资源。
+- **构建修复**: 解决了 `socket/socket.go` 和 `service/gateway/tower.go` 中的合并冲突，统一了代码版本。
 
 ### 架构重构 (Refactoring)
 - **内存管理简化**: 移除了针对小对象 (`FireInfo`, `FireTower`) 的 `sync.Pool`。利用 Go 1.18+ Runtime 优秀的 GC 能力，直接使用堆/栈分配。这消除了“Use-after-free”和“Double-free”导致的崩溃风险，且在基准测试中性能损耗仅 <6%，极大提升了代码稳定性和安全性。

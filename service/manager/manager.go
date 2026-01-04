@@ -103,8 +103,10 @@ func (t *topicGrpcService) GetConnectNum(ctx context.Context, request *pb.GetCon
 	value, ok := topicRelevance.Load(request.Topic)
 	var num int64
 	if ok {
+		t.mu.RLock()
 		l, _ := value.(*list.List)
 		num = getConnectNum(l)
+		t.mu.RUnlock()
 	}
 
 	return &pb.GetConnectNumResponse{Number: num}, nil
@@ -120,6 +122,8 @@ func getConnectNum(l *list.List) int64 {
 
 // SubscribeTopic 订阅topic的grpc接口
 func (t *topicGrpcService) SubscribeTopic(ctx context.Context, request *pb.SubscribeTopicRequest) (*pb.SubscribeTopicResponse, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	for _, topic := range request.Topic {
 		var store *list.List
 		value, ok := topicRelevance.Load(topic)
@@ -134,10 +138,19 @@ func (t *topicGrpcService) SubscribeTopic(ctx context.Context, request *pb.Subsc
 			topicRelevance.Store(topic, store)
 		} else {
 			store = value.(*list.List)
+			var found bool
 			for e := store.Front(); e != nil; e = e.Next() {
 				if e.Value.(*topicRelevanceItem).ip == request.Ip {
 					e.Value.(*topicRelevanceItem).num++
+					found = true
+					break
 				}
+			}
+			if !found {
+				store.PushBack(&topicRelevanceItem{
+					ip:  request.Ip,
+					num: 1,
+				})
 			}
 		}
 	}
@@ -146,6 +159,8 @@ func (t *topicGrpcService) SubscribeTopic(ctx context.Context, request *pb.Subsc
 
 // UnSubscribeTopic 取消订阅topic的grpc接口
 func (t *topicGrpcService) UnSubscribeTopic(ctx context.Context, request *pb.UnSubscribeTopicRequest) (*pb.UnSubscribeTopicResponse, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	for _, topic := range request.Topic {
 		value, ok := topicRelevance.Load(topic)
 

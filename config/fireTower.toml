@@ -3,13 +3,13 @@
 chanLens = 1000 # channal 缓冲区大小
 heartbeat = 600 # 心跳间隔 单位秒(s)
 
-topicServiceAddr = "0.0.0.0:6666"
+topicServiceAddr = "0.0.0.0:6666" # Manager TCP 推送/心跳服务监听地址
 
 [grpc]
-address = "localhost:6667"
+address = "localhost:6667" # Manager gRPC API 地址（订阅、退订、发布入口）
 
 [bucket]
 Num = 4 # 启动多少个Bucket
 CentralChanCount = 100000 # 整台服务器的消息中心处理通道容量
 BuffChanCount = 1000 # 每个bucket的消息通道容量
-ConsumerNum = 32 # 每个bucket有多少个消费者同时向socket中推送消息
+ConsumerNum = 32 # 每个bucket有多少个消费者同时向socket中推送消息；大群可按CPU核心数适当调高

@@ -1,3 +1,4 @@
+
 package socket
 
 import (
@@ -265,3 +266,4 @@ func (t *TcpClient) OnPush(fn func(message *SendMessage)) {
 		}
 	}()
 }
+
