@@ -2,7 +2,6 @@ package socket
 
 import (
 	"bytes"
-	"fmt"
 	"testing"
 )
 

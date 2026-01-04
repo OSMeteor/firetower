@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"fmt"
 	"sync"
 	"sync/atomic"
 
@@ -41,6 +42,11 @@ func buildBuckets() {
 
 	// 执行中心处理器 将所有推送消息推送到bucketNum个bucket中
 	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				fmt.Printf("PANIC: towerManager central processor recovered: %v\n", err)
+			}
+		}()
 		for {
 			select {
 			case message := <-TM.centralChan:
@@ -95,6 +101,14 @@ func (t *TowerManager) GetBucket(bt *FireTower) (bucket *Bucket) {
 }
 
 func (b *Bucket) consumer() {
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Printf("PANIC: bucket consumer recovered: %v\n", err)
+			// Restart consumer if needed, or just log. For now, logging prevents crash.
+			// Ideally we should restart it.
+			go b.consumer()
+		}
+	}()
 	for {
 		select {
 		case message := <-b.BuffChan:

@@ -127,6 +127,7 @@ tower.SetSubscribeHandler(func(context *gateway.FireLife, topic []string) bool {
 tower.SetUnSubscribeHandler(func(context *gateway.FireLife, topic []string) bool {
     for _, v := range topic {
         num := tower.GetConnectNum(v)
+        // 继承订阅消息的context
         var pushmsg = gateway.NewFireInfo(tower, context)
         pushmsg.Message.Topic = v
         pushmsg.Message.Data = []byte(fmt.Sprintf("{\"type\":\"onUnsubscribe\",\"data\":%d}", num))
@@ -137,6 +138,62 @@ tower.SetUnSubscribeHandler(func(context *gateway.FireLife, topic []string) bool
 ```
 注意：当客户端断开websocket连接时firetower会将其在线时订阅的所有topic进行退订 会触发UnSubscirbeHandler  
 
+## 系统架构与无限扩展指南 (System Architecture & Scalability Guide)
+
+Firetower 采用 **Gateway (接入层)** + **TopicManager (逻辑控制层)** 的分离架构设计。这种设计天生具备良好的扩展性。本指南将阐述如何从单机 Docker 部署演进到支撑百万级在线用户的分布式集群。
+
+### 1. 核心组件
+*   **Gateway (Websocket Service)**:
+    *   **职责**: 维护海量 WebSocket 长连接，处理协议封包/解包，执行消息广播。
+    *   **特性**: 仅处理连接逻辑，几乎无状态（订阅关系同步给 TM），**可无限水平扩展**。针对慢连接实现了非阻塞广播和自动丢包保护。
+*   **TopicManager (Topic Service)**:
+    *   **职责**: 管理 Topic -> Gateway 节点的映射关系，接收 Publish 请求并分发给持有该 Topic 订阅者的所有 Gateway。
+    *   **特性**: 目前为单点状态节点 (Stateful)，是扩展的瓶颈所在。
+
+### 2. 演进路线图
+
+#### 阶段一：单机/小规模集群 (Current)
+*   **适用场景**: < 50,000 在线用户，业务量适中。
+*   **部署**:
+    *   1个 TopicManager 实例。
+    *   N个 Gateway 实例 (N >= 2)，通过 Nginx/SLB 做 4层或7层负载均衡。
+    *   Gateway 启动时通过配置指向唯一的 TopicManager IP。
+
+#### 阶段二：TopicManager 分片 (Sharding)
+*   **适用场景**: < 500,000 在线用户，Topic 数量巨大。
+*   **改造方案**:
+    *   部署 M 个 TopicManager 节点。
+    *   **Gateway 改造**: 在连接 TM 时，不再连接单一节点，而是连接 TM 集群。
+    *   **路由算法**: 采用一致性哈希 (Consistent Hashing) 或 `Hash(Topic) % M` 算法。
+        *   当订阅 `Topic_A` 时，Gateway 计算 Hash 路由到 `TM_Node_1` 进行注册。
+        *   当发布 `Topic_A` 时，Gateway 同样路由到 `TM_Node_1` 进行发布。
+    *   **效果**: 将订阅关系管理的内存压力和匹配计算的 CPU 压力分散到集群中。
+
+#### 阶段三：无状态化与中间件集成 (Stateless & Middleware)
+*   **适用场景**: > 1,000,000 在线用户 (百万级并发)。
+*   **核心痛点**: 此时自研的 TopicManager 可能成为维护负担，且有状态服务的扩容迁移复杂。
+*   **改造方案**:
+    *   **移除 TopicManager**：完全废弃自研的 TopicManager 服务。
+    *   **引入 Redis Pub/Sub (或 Kafka/NATS)**：使用成熟的消息中间件作为 Topic 路由中心。
+    *   **Gateway 行为**:
+        *   用户订阅 `Topic_A` -> Gateway 直接向 Redis 订阅 `Channel_A`。
+        *   收到 Redis `Channel_A` 消息 -> Gateway 广播给本机所有订阅了 `Topic_A` 的 WebSocket 连接。
+    *   **优势**: 彻底利用云厂商提供的 Redis 集群能力，Gateway 变为完全无状态的纯连接层，实现真正的**无限水平扩展**。
+
+#### 阶段四：千万级超大规模 (Hierarchical Routing)
+*   **适用场景**: 各国头部 APP (如 WhatsApp, 微信)。
+*   **改造方案**:
+    *   **Bucket 预分片**: 引入 "Slot" 概念 (如 16384 个 Slot)。
+    *   **二级路由**: 建立 `Slot -> Gateway_IP_List` 的全局映射表 (存储在 Etcd/ZooKeeper)。
+    *   **边缘计算**: 消息先推送到 Slot 对应的“分发层”，再由分发层并行推送到具体的 Gateway 节点。
+
+### 3. 稳定性保障 (已实装)
+为支撑上述扩展，本项目在代码层面已实装以下企业级特性：
+*   **Panic Recovery**: 关键协程全覆盖，单点故障不扩散。
+*   **Non-blocking Send**: 防止慢消费者（弱网用户）拖死服务子系统。
+*   **Exponential Backoff**: 指数退避重连，防止服务重启时的流量雪崩。
+*   **Zero-Copy Logic**: 协议层优化，支撑高吞吐。
+ 
 ## TODO
 - 运行时web看板  
 - 提供推送相关http及grpc接口

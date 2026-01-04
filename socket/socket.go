@@ -26,9 +26,10 @@ type TcpClient struct {
 	isClose   bool
 	closeChan chan struct{}
 	Conn      net.Conn
-	readIn    chan *SendMessage
-	sendOut   chan []byte
-	mutex     sync.Mutex
+	readIn      chan *SendMessage
+	sendOut     chan []byte
+	mutex       sync.Mutex
+	manualClose bool
 }
 
 // PushMessage 推送消息结构体
@@ -101,6 +102,11 @@ func (t *TcpClient) Connect() error {
 	t.Conn = lis
 
 	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				fmt.Printf("PANIC: tcp client send loop recovered: %v\n", err)
+			}
+		}()
 		for {
 			select {
 			case message := <-t.sendOut:
@@ -117,6 +123,11 @@ func (t *TcpClient) Connect() error {
 
 	// read channal
 	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				fmt.Printf("PANIC: tcp client read loop recovered: %v\n", err)
+			}
+		}()
 		var overflow []byte
 		for {
 			var msg = make([]byte, 1024*16)
@@ -161,16 +172,9 @@ func (t *TcpClient) Close() {
 		// NOTE: Calling Connect() inside Lock() might be dangerous if Connect() takes a long time (Dial).
 		// But Connect() launches goroutines.
 		// Ideally we should unlock before Connect, but we need to ensure state is consistent.
-		// However, Close() is supposed to close the connection. Why does it call Connect()?
-		// It seems it tries to AUTO-RECONNECT immediately?
-		// "socket close" -> "Retry ... Connect".
-		// This means this is a "Restart" rather than "Close".
-		// If I rename this, it breaks API.
-		// If I use lock around the whole thing, Dial will hold the lock.
-		// If another goroutine calls Send(), it will block on lock until Dial finishes. This is probably fine for safety.
-		// But wait, Connect changes t.isClose = false.
-		// So Close() toggles isClose true -> false.
-		
+		if t.manualClose {
+			return
+		}
 		err := t.Connect()
 		if err != nil {
 			fmt.Println("[topic manager] wait topic manager online", t.Address)
@@ -182,6 +186,20 @@ func (t *TcpClient) Close() {
 			fmt.Println("[topic manager] connected:", t.Address)
 		}
 	}
+}
+
+// Shutdown 永久关闭客户端，不进行重连
+func (t *TcpClient) Shutdown() {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	t.manualClose = true
+	t.isClose = true
+	if t.Conn != nil {
+		t.Conn.Close()
+	}
+	// closeChan might already be closed if Close() was called concurrently?
+	// If Close() was called, isClose is true, manualClose is true.
+	// We want to ensure any blocking Read/Send returns.
 }
 
 // Read 从tcp通道中读取消息
@@ -229,10 +247,17 @@ func (t *TcpClient) Publish(messageId, source, topic string, data json.RawMessag
 // OnPush 当有新的推送消息到达tcp客户端时触发
 func (t *TcpClient) OnPush(fn func(message *SendMessage)) {
 	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				fmt.Printf("PANIC: OnPush callback runner recovered: %v\n", err)
+			}
+		}()
 		for {
 			message, err := t.Read()
 			if err != nil {
-				message.Panic(err.Error())
+				if message != nil {
+					message.Panic(err.Error())
+				}
 				// 只可能是连接断开了
 				return
 			}

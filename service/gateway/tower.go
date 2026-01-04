@@ -31,8 +31,6 @@ var (
 	// FireLogger 接管链接log t log类型 info log信息
 	FireLogger func(f *FireInfo, types, info string)
 
-	towerPool sync.Pool
-	firePool  sync.Pool
 	// IdWorker 全局唯一id生成器实例
 	IdWorker *snowFlakeByGo.Worker
 )
@@ -60,14 +58,18 @@ type TopicMessage struct {
 
 // NewFireInfo 第二个参数的作用是继承
 // 继承上一个消息体的上下文，方便日志追踪或逻辑统一
+// NewFireInfo 第二个参数的作用是继承
+// 继承上一个消息体的上下文，方便日志追踪或逻辑统一
 func NewFireInfo(t *FireTower, context *FireLife) *FireInfo {
-	fireInfo := firePool.Get().(*FireInfo)
+	// Replaced sync.Pool with direct allocation for better safety and simplicity.
+	// Go's GC handles short-lived small objects very efficiently.
+	fireInfo := &FireInfo{
+		Context: new(FireLife),
+		Message: new(TopicMessage),
+	}
+
 	if context != nil {
-		if fireInfo != nil && fireInfo.Context != nil {
-			fireInfo.Context = context
-		} else {
-			return fireInfo
-		}
+		fireInfo.Context = context
 	} else {
 		fireInfo.Context.reset(t)
 	}
@@ -75,8 +77,9 @@ func NewFireInfo(t *FireTower, context *FireLife) *FireInfo {
 }
 
 // Recycling 变量回收
+// Recycling 变量回收
+// Deprecated: No-op. We now rely on Go GC.
 func (f *FireInfo) Recycling() {
-	firePool.Put(f)
 }
 
 // Panic 消息的panic日志 并回收变量
@@ -140,18 +143,9 @@ type FireTower struct {
 
 // Init 初始化firetower
 // 在调用firetower前请一定要先调用Init方法
+// Init 初始化firetower
+// 在调用firetower前请一定要先调用Init方法
 func Init() {
-	towerPool.New = func() interface{} {
-		return &FireTower{}
-	}
-
-	firePool.New = func() interface{} {
-		return &FireInfo{
-			Context: new(FireLife),
-			Message: new(TopicMessage),
-		}
-	}
-
 	IdWorker, _ = snowFlakeByGo.NewWorker(ClusterId)
 
 	TowerLogger = towerLog
@@ -177,7 +171,7 @@ func BuildTower(ws *websocket.Conn, clientId string) (tower *FireTower) {
 }
 
 func buildNewTower(ws *websocket.Conn, clientId string) *FireTower {
-	t := towerPool.Get().(*FireTower)
+	t := &FireTower{}
 	t.connId = getConnId()
 	t.ClientId = clientId
 	t.startTime = time.Now()
@@ -300,12 +294,25 @@ func (t *FireTower) read() (*FireInfo, error) {
 
 // Send 发送消息方法
 // 向某个topic发送某段信息
+// Send 发送消息方法
+// 向某个topic发送某段信息
 func (t *FireTower) Send(message *socket.SendMessage) error {
 	if t.isClose {
 		return ErrorClose
 	}
-	t.sendOut <- message
-	return nil
+	// 非阻塞发送，防止慢消费者阻塞整个 Bucket 的分发
+	select {
+	case t.sendOut <- message:
+		return nil
+	default:
+		// 缓冲区满，丢弃消息，防止阻塞上游
+		// 在生产环境中，这里应该增加一个 Metric 指标，记录丢弃的消息数量
+		if TowerLogger != nil {
+			TowerLogger(t, "WARN", "send buffer full, message dropped")
+		}
+		// 返回错误让上层知道发送失败
+		return errors.New("send buffer full")
+	}
 }
 
 // Close 关闭客户端连接并注销
@@ -337,11 +344,17 @@ func (t *FireTower) Close() {
 		if t.onOfflineHandler != nil {
 			t.onOfflineHandler()
 		}
-		towerPool.Put(t)
+		// towerPool.Put(t) // Removed pool
 	}
 }
 
 func (t *FireTower) sendLoop() {
+	defer func() {
+		if err := recover(); err != nil {
+			towerLog(t, "PANIC", fmt.Sprintf("sendLoop panic: %v", err))
+			t.Close()
+		}
+	}()
 	heartTicker := time.NewTicker(time.Duration(ConfigTree.Get("heartbeat").(int64)) * time.Second)
 	for {
 		select {
@@ -407,10 +420,23 @@ collapse:
 // 处理前端发来的数据
 // 这里要做逻辑拆分，判断用户是要进行通信还是topic订阅
 func (t *FireTower) readDispose() {
+	defer func() {
+		if err := recover(); err != nil {
+			towerLog(t, "PANIC", fmt.Sprintf("readDispose panic: %v", err))
+			t.Close()
+		}
+	}()
 	for {
 		fire, err := t.read()
 		if err != nil {
-			fire.Panic(fmt.Sprintf("read message failed:%v", err))
+			if fire != nil {
+				fire.Panic(fmt.Sprintf("read message failed:%v", err))
+			} else {
+				// Manually log if fire is nil
+				if TowerLogger != nil {
+					TowerLogger(t, "ERROR", fmt.Sprintf("read message failed:%v", err))
+				}
+			}
 			t.Close()
 			return
 		} else if t.isClose {
