@@ -60,6 +60,9 @@ type topicGrpcService struct {
 //     Data  传输内容
 //     MessageId gateway 来源的消息id
 func (t *topicGrpcService) Publish(ctx context.Context, request *pb.PublishRequest) (*pb.PublishResponse, error) {
+	if t == nil || request == nil {
+		return &pb.PublishResponse{Ok: false}, errors.New("empty request")
+	}
 	Logger("INFO", fmt.Sprintf("new message: %s", string(request.Data)))
 
 	value, ok := topicRelevance.Load(request.Topic)
@@ -68,19 +71,30 @@ func (t *topicGrpcService) Publish(ctx context.Context, request *pb.PublishReque
 		return &pb.PublishResponse{Ok: false}, errors.New("topic not exist")
 	}
 
-	table := value.(*list.List)
+	table, _ := value.(*list.List)
+	if table == nil {
+		return &pb.PublishResponse{Ok: false}, errors.New("topic not exist")
+	}
 	t.mu.Lock()
 	for e := table.Front(); e != nil; e = e.Next() {
-		c, ok := ConnIndexTable.Load(e.Value.(*topicRelevanceItem).ip)
-		if ok {
-			b, err := socket.Enpack(socket.PublishKey, request.MessageId, request.Source, request.Topic, request.Data)
-			if err != nil {
-
-			}
-			_, err = c.(*connectBucket).conn.Write(b)
-			if err != nil {
-				c.(*connectBucket).close()
-			}
+		item, _ := e.Value.(*topicRelevanceItem)
+		if item == nil {
+			continue
+		}
+		c, ok := ConnIndexTable.Load(item.ip)
+		if !ok || c == nil {
+			continue
+		}
+		bucket, _ := c.(*connectBucket)
+		if bucket == nil || bucket.conn == nil {
+			continue
+		}
+		b, err := socket.Enpack(socket.PublishKey, request.MessageId, request.Source, request.Topic, request.Data)
+		if err != nil {
+			continue
+		}
+		if _, err = bucket.conn.Write(b); err != nil {
+			bucket.close()
 		}
 	}
 	t.mu.Unlock()
@@ -270,10 +284,20 @@ func (c *connectBucket) relation() {
 }
 
 func (c *connectBucket) delRelation() {
+	if c == nil || c.conn == nil || c.conn.RemoteAddr() == nil {
+		return
+	}
+	ip := c.conn.RemoteAddr().String()
 	topicRelevance.Range(func(key, value interface{}) bool {
 		store, _ := value.(*list.List)
-		for e := store.Front(); e != nil; e = e.Next() {
-			if e.Value.(*topicRelevanceItem).ip == c.conn.RemoteAddr().String() {
+		if store == nil {
+			return true
+		}
+		var next *list.Element
+		for e := store.Front(); e != nil; e = next {
+			next = e.Next()
+			item, _ := e.Value.(*topicRelevanceItem)
+			if item != nil && item.ip == ip {
 				store.Remove(e)
 			}
 		}
@@ -285,14 +309,23 @@ func (c *connectBucket) delRelation() {
 }
 
 func (c *connectBucket) close() {
+	if c == nil {
+		return
+	}
 	c.mu.Lock()
-	if !c.isClose {
-		c.isClose = true
+	if c.isClose {
+		c.mu.Unlock()
+		return
+	}
+	c.isClose = true
+	if c.closeChan != nil {
 		close(c.closeChan)
-		c.conn.Close()
-		c.delRelation() // 删除topic绑定关系
+	}
+	if c.conn != nil {
+		_ = c.conn.Close()
 	}
 	c.mu.Unlock()
+	c.delRelation()
 }
 
 func (c *connectBucket) handler() {
@@ -326,26 +359,41 @@ func (c *connectBucket) sendLoop() {
 	for {
 		select {
 		case message := <-c.packetChan:
-
+			if message == nil || message.Context == nil {
+				continue
+			}
 			value, ok := topicRelevance.Load(message.Topic)
 			if !ok {
 				// topic 没有存在订阅列表中直接过滤
 				continue
 			} else {
-				table := value.(*list.List)
+				table, _ := value.(*list.List)
+				if table == nil {
+					continue
+				}
 				for e := table.Front(); e != nil; e = e.Next() {
-					bucket, ok := ConnIndexTable.Load(e.Value.(*topicRelevanceItem).ip)
-					if ok {
-						bytes, err := socket.Enpack(message.Type, message.Context.Id, message.Context.Source, message.Topic, message.Data)
-						if err != nil {
+					item, _ := e.Value.(*topicRelevanceItem)
+					if item == nil {
+						continue
+					}
+					raw, ok := ConnIndexTable.Load(item.ip)
+					if !ok || raw == nil {
+						continue
+					}
+					bucket, _ := raw.(*connectBucket)
+					if bucket == nil || bucket.conn == nil {
+						continue
+					}
+					bytes, err := socket.Enpack(message.Type, message.Context.Id, message.Context.Source, message.Topic, message.Data)
+					if err != nil {
+						if Logger != nil {
 							Logger("ERROR", fmt.Sprintf("protocol 封包时错误，%v", err))
 						}
-						_, err = bucket.(*connectBucket).conn.Write(bytes)
-						if err != nil {
-							// 直接操作table.Remove 可以改变map中list的值
-							bucket.(*connectBucket).close()
-							return
-						}
+						continue
+					}
+					if _, err = bucket.conn.Write(bytes); err != nil {
+						bucket.close()
+						return
 					}
 				}
 			}
@@ -361,19 +409,35 @@ func (c *connectBucket) heartbeat() {
 	defer func() {
 		if err := recover(); err != nil {
 			Logger("PANIC", fmt.Sprintf("heartbeat panic: %v", err))
-			c.close()
+			if c != nil {
+				c.close()
+			}
 		}
 	}()
-	t := time.NewTicker(10 * time.Second)
+	if c == nil || c.conn == nil || c.closeChan == nil {
+		return
+	}
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
 	// 心跳包内容固定 所以只用封包一次 直接用封好的包发送就可以了
 	// 服务器间心跳时间应该短一些，以便及时获取连接状态
-	b, _ := socket.Enpack("heartbeat", "0", "system", "*", []byte("heartbeat"))
+	b, err := socket.Enpack("heartbeat", "0", "system", "*", []byte("heartbeat"))
+	if err != nil {
+		return
+	}
 	for {
-		<-t.C
-		_, err := c.conn.Write(b)
-		if err != nil {
-			c.close()
+		select {
+		case <-c.closeChan:
 			return
+		case <-ticker.C:
+			if c.conn == nil {
+				c.close()
+				return
+			}
+			if _, err = c.conn.Write(b); err != nil {
+				c.close()
+				return
+			}
 		}
 	}
 }

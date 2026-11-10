@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
+	"os"
 	"strconv"
 
 	"github.com/OSMeteor/firetower/service/gateway"
@@ -36,8 +37,12 @@ func main() {
 	gateway.ClusterId = 1
 	gateway.Init()
 	http.HandleFunc("/ws", Websocket)
-	fmt.Println("websocket service start: 0.0.0.0:9999")
-	http.ListenAndServe("0.0.0.0:9999", nil)
+	addr := os.Getenv("FIRETOWER_HTTP")
+	if addr == "" {
+		addr = "0.0.0.0:9999"
+	}
+	fmt.Println("websocket service start:", addr)
+	http.ListenAndServe(addr, nil)
 }
 
 // Websocket http转websocket连接 并实例化firetower

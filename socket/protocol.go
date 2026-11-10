@@ -15,6 +15,8 @@ const (
 	ConstIntLength    = 4 // int转byte长度为4
 	ConstSplitSpace   = " "
 	ConstNewLine      = '\n'
+	// MaxFrameLength 单帧最大长度。超过或为负的声明长度直接拒绝，避免 panic 和内存耗尽。
+	MaxFrameLength = 1 << 20
 )
 
 // firetower protocol
@@ -62,15 +64,18 @@ func Depack(buffer []byte, readerChannel chan *SendMessage) ([]byte, error) {
 		// 寻找包的开头
 		if string(buffer[i:i+ConstHeaderLength]) == ConstHeader {
 			messageLength := BytesToInt(buffer[i+ConstHeaderLength : i+ConstHeaderLength+ConstIntLength])
+			if messageLength < 0 || messageLength > MaxFrameLength {
+				return nil, errors.New("invalid frame length")
+			}
 			if length < i+ConstHeaderLength+ConstIntLength+messageLength {
 				// 长度不够，说明是半包，跳出循环等待下一次数据拼接
 				break
 			}
-			
+
 			// 提取数据段
 			data := buffer[i+ConstHeaderLength+ConstIntLength : i+ConstHeaderLength+ConstIntLength+messageLength]
 			reader := bufio.NewReader(bytes.NewReader(data))
-			
+
 			var (
 				params  [][]byte
 				param   []byte
@@ -93,10 +98,10 @@ func Depack(buffer []byte, readerChannel chan *SendMessage) ([]byte, error) {
 				i += ConstHeaderLength + ConstIntLength + messageLength
 				continue
 			}
-			// content should take n bytes. 
-			// Wait, reader.Read(content) reads UP TO len(content). 
+			// content should take n bytes.
+			// Wait, reader.Read(content) reads UP TO len(content).
 			// Since we created reader from fixed size data, it should read it all.
-			
+
 			// Re-assemble params
 			if len(params) > 0 {
 				params = append(params, content[:n])
@@ -107,9 +112,9 @@ func Depack(buffer []byte, readerChannel chan *SendMessage) ([]byte, error) {
 				err = errors.New("包解析出错")
 				// 仅仅记录错误，不返回，继续解析后续
 				i += ConstHeaderLength + ConstIntLength + messageLength
-				continue 
+				continue
 			}
-			
+
 			sendMessage := GetSendMessage(string(params[1]), string(params[2]))
 			if len(params) > 0 {
 				sendMessage.Type = string(params[0])
@@ -128,22 +133,29 @@ func Depack(buffer []byte, readerChannel chan *SendMessage) ([]byte, error) {
 				// If split produced fewer...
 			}
 			// Using original logic strict check:
-			// Original: 
+			// Original:
 			// params = bytes.Split(param, ...)
 			// params = append(params, content[:n])
 			// if len(params) < 3 ...
 			// sendMessage.Type = string(params[0])
 			// sendMessage.Topic = string(params[3]) -> panic if len < 4
 			// sendMessage.Data = params[4] -> panic if len < 5
-			
+
 			// Defensive coding:
 			if len(params) >= 5 {
 				sendMessage.Type = string(params[0])
 				sendMessage.Topic = string(params[3])
 				sendMessage.Data = params[4]
-				readerChannel <- sendMessage
+				if readerChannel == nil {
+					return nil, errors.New("result channel is nil")
+				}
+				select {
+				case readerChannel <- sendMessage:
+				default:
+					return nil, errors.New("result queue full")
+				}
 			}
-			
+
 			// IMPORTANT: Advance index
 			i += ConstHeaderLength + ConstIntLength + messageLength
 		} else {
@@ -152,7 +164,7 @@ func Depack(buffer []byte, readerChannel chan *SendMessage) ([]byte, error) {
 			i++
 		}
 	}
-	
+
 	if i >= length {
 		return make([]byte, 0), nil
 	}

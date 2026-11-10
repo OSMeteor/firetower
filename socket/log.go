@@ -38,26 +38,44 @@ var (
 
 // Recycling 回收SendMessage对象
 func (s *SendMessage) Recycling() {
+	if s == nil {
+		return
+	}
 	sendPool.Put(s)
 }
 
 // Panic 记录一个Panic错误日志并回收SendMessage对象
 func (s *SendMessage) Panic(info string) {
-	SendLogger(s, "Panic", info)
+	if s == nil {
+		return
+	}
+	if SendLogger != nil {
+		SendLogger(s, "Panic", info)
+	}
 	s.Recycling()
 }
 
 // Info 记录一个INFO级别的日志
 func (s *SendMessage) Info(info string) {
+	if s == nil || SendLogger == nil {
+		return
+	}
 	SendLogger(s, "INFO", info)
 }
 
 // Error 记录一个ERROR级别的日志
 func (s *SendMessage) Error(info string) {
+	if s == nil || SendLogger == nil {
+		return
+	}
 	SendLogger(s, "ERROR", info)
 }
 
 func sendLog(s *SendMessage, types, info string) {
+	if s == nil || s.Context == nil {
+		fmt.Fprintf(os.Stderr, "[SendInfo] %s nil message | LOG %s\n", types, info)
+		return
+	}
 	if types == "INFO" {
 		if LogLevel != "INFO" {
 			return

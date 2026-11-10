@@ -1,7 +1,7 @@
-
 package socket
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -23,14 +23,17 @@ const (
 
 // TcpClient tcp客户端结构体
 type TcpClient struct {
-	Address   string
-	isClose   bool
-	closeChan chan struct{}
-	Conn      net.Conn
-	readIn      chan *SendMessage
-	sendOut     chan []byte
-	mutex       sync.Mutex
-	manualClose bool
+	Address      string
+	isClose      bool
+	closeChan    chan struct{}
+	Conn         net.Conn
+	readIn       chan *SendMessage
+	sendOut      chan []byte
+	mutex        sync.Mutex
+	manualClose  bool
+	reconnecting bool
+	generation   uint64
+	dialID       uint64
 }
 
 // PushMessage 推送消息结构体
@@ -92,128 +95,288 @@ func NewClient(address string) *TcpClient {
 	}
 }
 
-// Connect 建立tcp连接
+// CurrentAddr 返回当前连接的本地地址。重连替换连接时持锁读取。
+func (t *TcpClient) CurrentAddr() string {
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	if t.Conn == nil || t.Conn.LocalAddr() == nil {
+		return ""
+	}
+	return t.Conn.LocalAddr().String()
+}
+
+// dialTCP 是连接入口，测试用来插入可暂停的连接以复现旧读协程误关新连接。
+var dialTCP = func(network, address string) (net.Conn, error) {
+	return net.Dial(network, address)
+}
+
+// Connect 建立tcp连接。失败时不启动读写协程。
 func (t *TcpClient) Connect() error {
-	lis, err := net.Dial("tcp", t.Address)
+	if t == nil {
+		return errors.New("nil tcp client")
+	}
+	if t.Address == "" {
+		return errors.New("empty address")
+	}
+	lis, err := dialTCP("tcp", t.Address)
 	if err != nil {
 		return err
 	}
-	t.isClose = false
-	t.closeChan = make(chan struct{})
-	t.Conn = lis
-
-	go func() {
-		defer func() {
-			if err := recover(); err != nil {
-				fmt.Printf("PANIC: tcp client send loop recovered: %v\n", err)
-			}
-		}()
-		for {
-			select {
-			case message := <-t.sendOut:
-				if _, err := lis.Write(message); err != nil {
-					goto close
-				}
-			case <-t.closeChan:
-				return
-			}
-		}
-	close:
-		t.Close()
-	}()
-
-	// read channal
-	go func() {
-		defer func() {
-			if err := recover(); err != nil {
-				fmt.Printf("PANIC: tcp client read loop recovered: %v\n", err)
-			}
-		}()
-		var overflow []byte
-		for {
-			var msg = make([]byte, 1024*16)
-
-			l, err := lis.Read(msg)
-			if err != nil {
-				if !t.isClose {
-					t.Close()
-				}
-				return
-			}
-			overflow, err = Depack(append(overflow, msg[:l]...), t.readIn)
-			if err != nil {
-				fmt.Println("[manager client] depack error:", err)
-			}
-			select {
-			case <-t.closeChan:
-				if !t.isClose {
-					t.Close()
-					return
-				}
-			default:
-			}
-		}
-	}()
-
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	if t.manualClose {
+		_ = lis.Close()
+		return ErrorClose
+	}
+	t.swapConnLocked(lis)
+	fmt.Println("[topic manager] connected:", t.Address)
 	return nil
 }
 
-// Close 关闭tcp连接
+// swapConnLocked 替换底层连接，并使上一代读写协程失效。
+func (t *TcpClient) swapConnLocked(lis net.Conn) {
+	t.disarmLocked()
+	t.generation++
+	gen := t.generation
+	t.isClose = false
+	stop := make(chan struct{})
+	t.closeChan = stop
+	t.Conn = lis
+	go t.writeLoop(lis, stop, gen)
+	go t.readLoopConn(lis, stop, gen)
+}
+
+// disarmLocked 关闭当前连接并作废它的协程。调用方必须持有 mutex。
+func (t *TcpClient) disarmLocked() {
+	t.generation++
+	t.isClose = true
+	if t.Conn != nil {
+		_ = t.Conn.Close()
+		t.Conn = nil
+	}
+	if t.closeChan != nil {
+		select {
+		case <-t.closeChan:
+		default:
+			close(t.closeChan)
+		}
+	}
+}
+
+// Close 关闭当前连接并在未 Shutdown 时重连。同一时刻只保留一个重连协程。
 func (t *TcpClient) Close() {
+	if t == nil {
+		return
+	}
+	fmt.Println("socket close")
 	t.mutex.Lock()
-	defer t.mutex.Unlock()
-	if !t.isClose {
-		fmt.Println("socket close")
-		t.isClose = true
-		t.Conn.Close()
-		close(t.closeChan)
-	Retry:
-		// Since Connect calls a goroutine that might access t.isClose, and Close calls Connect...
-		// Connect itself does not block significantly except for Dial.
-		// NOTE: Calling Connect() inside Lock() might be dangerous if Connect() takes a long time (Dial).
-		// But Connect() launches goroutines.
-		// Ideally we should unlock before Connect, but we need to ensure state is consistent.
-		if t.manualClose {
+	if t.manualClose {
+		t.disarmLocked()
+		t.mutex.Unlock()
+		return
+	}
+	t.disarmLocked()
+	t.startDialLocked()
+	t.mutex.Unlock()
+}
+
+// Shutdown 永久关闭客户端，不进行重连，并唤醒阻塞中的 Read。
+func (t *TcpClient) Shutdown() {
+	if t == nil {
+		return
+	}
+	t.mutex.Lock()
+	t.manualClose = true
+	t.reconnecting = false
+	t.disarmLocked()
+	t.mutex.Unlock()
+}
+
+func (t *TcpClient) startDialLocked() {
+	if t.manualClose || t.reconnecting {
+		return
+	}
+	t.reconnecting = true
+	t.dialID++
+	go t.dialLoop(t.dialID)
+}
+
+func (t *TcpClient) dialLoop(id uint64) {
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Printf("PANIC: tcp dial loop recovered: %v\n", err)
+		}
+		t.mutex.Lock()
+		if t.dialID == id {
+			t.reconnecting = false
+		}
+		t.mutex.Unlock()
+	}()
+	for {
+		t.mutex.Lock()
+		stop := t.manualClose
+		t.mutex.Unlock()
+		if stop {
 			return
 		}
 		err := t.Connect()
-		if err != nil {
-			fmt.Println("[topic manager] wait topic manager online", t.Address)
-			t.mutex.Unlock() // Unlock while sleeping
-			time.Sleep(time.Duration(1) * time.Second)
-			t.mutex.Lock() // Re-lock
-			goto Retry
-		} else {
-			fmt.Println("[topic manager] connected:", t.Address)
+		if errors.Is(err, ErrorClose) {
+			return
+		}
+		if err == nil {
+			t.mutex.Lock()
+			stopCh := t.closeChan
+			manual := t.manualClose
+			t.mutex.Unlock()
+			if manual || stopCh == nil {
+				return
+			}
+			<-stopCh
+			if !t.waitRetry() {
+				return
+			}
+			continue
+		}
+		fmt.Println("[topic manager] wait topic manager online", t.Address)
+		timer := time.NewTimer(time.Second)
+		t.mutex.Lock()
+		stop = t.manualClose
+		t.mutex.Unlock()
+		if stop {
+			timer.Stop()
+			return
+		}
+		<-timer.C
+	}
+}
+
+func (t *TcpClient) waitRetry() bool {
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	pulse := time.NewTicker(50 * time.Millisecond)
+	defer pulse.Stop()
+	for {
+		select {
+		case <-timer.C:
+			t.mutex.Lock()
+			stop := t.manualClose
+			t.mutex.Unlock()
+			return !stop
+		case <-pulse.C:
+			t.mutex.Lock()
+			stop := t.manualClose
+			t.mutex.Unlock()
+			if stop {
+				return false
+			}
 		}
 	}
 }
 
-// Shutdown 永久关闭客户端，不进行重连
-func (t *TcpClient) Shutdown() {
-	t.mutex.Lock()
-	defer t.mutex.Unlock()
-	t.manualClose = true
-	t.isClose = true
-	if t.Conn != nil {
-		t.Conn.Close()
+func (t *TcpClient) onConnLost(gen uint64) {
+	if t == nil {
+		return
 	}
-	// closeChan might already be closed if Close() was called concurrently?
-	// If Close() was called, isClose is true, manualClose is true.
-	// We want to ensure any blocking Read/Send returns.
+	t.mutex.Lock()
+	if t.manualClose || gen != t.generation {
+		t.mutex.Unlock()
+		return
+	}
+	t.disarmLocked()
+	t.startDialLocked()
+	t.mutex.Unlock()
 }
 
-// Read 从tcp通道中读取消息
+func (t *TcpClient) writeLoop(conn net.Conn, stop <-chan struct{}, gen uint64) {
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Printf("PANIC: tcp client send loop recovered: %v\n", err)
+			t.onConnLost(gen)
+		}
+	}()
+	for {
+		select {
+		case <-stop:
+			return
+		case message, ok := <-t.sendOut:
+			if !ok {
+				return
+			}
+			if conn == nil {
+				t.onConnLost(gen)
+				return
+			}
+			if _, err := conn.Write(message); err != nil {
+				t.onConnLost(gen)
+				return
+			}
+		}
+	}
+}
+
+func (t *TcpClient) readLoopConn(conn net.Conn, stop <-chan struct{}, gen uint64) {
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Printf("PANIC: tcp client read loop recovered: %v\n", err)
+			t.onConnLost(gen)
+		}
+	}()
+	if conn == nil {
+		t.onConnLost(gen)
+		return
+	}
+	var overflow []byte
+	for {
+		msg := make([]byte, 1024*16)
+		n, err := conn.Read(msg)
+		if err != nil {
+			t.onConnLost(gen)
+			return
+		}
+		if t.readIn == nil {
+			t.onConnLost(gen)
+			return
+		}
+		overflow, err = Depack(append(overflow, msg[:n]...), t.readIn)
+		if err != nil {
+			fmt.Println("[manager client] depack error:", err)
+		}
+		select {
+		case <-stop:
+			return
+		default:
+		}
+	}
+}
+
+// Read 从tcp通道中读取消息。Shutdown 或连接替换会把它唤醒。
 func (t *TcpClient) Read() (*SendMessage, error) {
-	if t.isClose {
+	if t == nil || t.readIn == nil {
 		return nil, ErrorClose
 	}
 	for {
-		message := <-t.readIn
-		if string(message.Type) == "heartbeat" {
-			continue
+		t.mutex.Lock()
+		stop := t.closeChan
+		manual := t.manualClose
+		t.mutex.Unlock()
+		if manual && stop == nil {
+			return nil, ErrorClose
 		}
-		return message, nil
+		select {
+		case message, ok := <-t.readIn:
+			if !ok || message == nil {
+				if manual {
+					return nil, ErrorClose
+				}
+				continue
+			}
+			if message.Type == "heartbeat" {
+				continue
+			}
+			return message, nil
+		case <-stop:
+			return nil, ErrorClose
+		}
 	}
 }
 
@@ -245,8 +408,12 @@ func (t *TcpClient) Publish(messageId, source, topic string, data json.RawMessag
 	return t.send(b)
 }
 
-// OnPush 当有新的推送消息到达tcp客户端时触发
+// OnPush 当有新的推送消息到达tcp客户端时触发。
+// 单次连接断开只表示这一代连接结束。重连后的消息仍要继续交给回调，直到 Shutdown。
 func (t *TcpClient) OnPush(fn func(message *SendMessage)) {
+	if t == nil || fn == nil {
+		return
+	}
 	go func() {
 		defer func() {
 			if err := recover(); err != nil {
@@ -259,11 +426,16 @@ func (t *TcpClient) OnPush(fn func(message *SendMessage)) {
 				if message != nil {
 					message.Panic(err.Error())
 				}
-				// 只可能是连接断开了
-				return
+				t.mutex.Lock()
+				manual := t.manualClose
+				t.mutex.Unlock()
+				if manual {
+					return
+				}
+				time.Sleep(50 * time.Millisecond)
+				continue
 			}
 			fn(message)
 		}
 	}()
 }
-

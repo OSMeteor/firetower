@@ -24,29 +24,59 @@ var (
 // 打印日志信息
 // 输出格式 [firetower] 2018-08-09 17:49:30 INFO info
 func logInfo(t *FireTower, info string) {
+	if TowerLogger == nil {
+		return
+	}
 	TowerLogger(t, "INFO", info)
 }
 
 func towerLog(t *FireTower, types, err string) {
+	var (
+		connID   uint64
+		clientID string
+		userID   string
+		started  time.Time
+	)
+	if t != nil {
+		connID = t.connId
+		clientID = t.ClientId
+		userID = t.UserId
+		started = t.startTime
+	}
+	writer := DefaultErrorWriter
+	if writer == nil {
+		writer = os.Stderr
+	}
 	fmt.Fprintf(
-		DefaultErrorWriter,
+		writer,
 		"[FireTower] %s %s %s | LOGTIME %s | RUNTIME %s %v %s | CONNID %d | CLIENTID %s | USERID %s | LOG %s\n",
 		socket.Green, types, socket.Reset,
 		time.Now().Format("2006-01-02 15:04:05"),
-		socket.Green, t.startTime.Format("2006-01-02 15:04:05"), socket.Reset,
-		t.connId,
-		t.ClientId,
-		t.UserId,
+		socket.Green, started.Format("2006-01-02 15:04:05"), socket.Reset,
+		connID,
+		clientID,
+		userID,
 		err)
 }
 
 func fireLog(f *FireInfo, types, info string) {
+	if f == nil || f.Context == nil || f.Message == nil {
+		return
+	}
+	out := DefaultWriter
+	errw := DefaultErrorWriter
+	if out == nil {
+		out = os.Stderr
+	}
+	if errw == nil {
+		errw = os.Stderr
+	}
 	if types == "INFO" {
 		if LogLevel != "INFO" {
 			return
 		}
 		fmt.Fprintf(
-			DefaultWriter,
+			out,
 			"[FireInfo] %s %s %s | LOGTIME %s | RUNTIME %s %v %s | MSGID %s | EVENT %s %s %s | TOPIC %s %s %s | DATA %s | LOG %s\n",
 			socket.Green, types, socket.Reset,
 			time.Now().Format("2006-01-02 15:04:05"),
@@ -59,7 +89,7 @@ func fireLog(f *FireInfo, types, info string) {
 	} else {
 		if f != nil && f.Context != nil {
 			fmt.Fprintf(
-				DefaultErrorWriter,
+				errw,
 				"[FireInfo] %s %s %s | LOGTIME %s | RUNTIME %s %v %s | MSGID %s | EVENT %s %s %s | TOPIC %s %s %s | DATA %s | LOG %s\n",
 				socket.Red, types, socket.Reset,
 				time.Now().Format("2006-01-02 15:04:05"),
