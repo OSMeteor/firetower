@@ -24,13 +24,20 @@ var (
 // 打印日志信息
 // 输出格式 [firetower] 2018-08-09 17:49:30 INFO info
 func logInfo(t *FireTower, info string) {
-	if TowerLogger == nil {
-		return
-	}
-	TowerLogger(t, "INFO", info)
+	callTowerLogger(t, "INFO", info)
 }
 
 func towerLog(t *FireTower, types, err string) {
+	switch types {
+	case "INFO":
+		if LogLevel != "INFO" {
+			return
+		}
+	case "WARN":
+		if LogLevel == "ERROR" {
+			return
+		}
+	}
 	var (
 		connID   uint64
 		clientID string

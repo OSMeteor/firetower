@@ -20,7 +20,33 @@ func init() {
 	}
 }
 func main() {
+	grpcPort, ok := configPort("grpc.port")
+	socketPort, okSocket := configPort("socket.port")
+	if !ok || !okSocket {
+		fmt.Println("config load failed")
+		return
+	}
 	m := &manager.Manager{}
-	go m.StartGrpcService(fmt.Sprintf(":%d", ConfigTree.Get("grpc.port").(int64)))
-	m.StartSocketService(fmt.Sprintf("0.0.0.0:%d", ConfigTree.Get("socket.port").(int64)))
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Println("grpc service panic:", r)
+			}
+		}()
+		if err := m.StartGrpcService(fmt.Sprintf(":%d", grpcPort)); err != nil {
+			fmt.Println("grpc service:", err)
+		}
+	}()
+	m.StartSocketService(fmt.Sprintf("0.0.0.0:%d", socketPort))
+}
+
+func configPort(key string) (int64, bool) {
+	if ConfigTree == nil {
+		return 0, false
+	}
+	port, ok := ConfigTree.Get(key).(int64)
+	if !ok || port <= 0 {
+		return 0, false
+	}
+	return port, true
 }

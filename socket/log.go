@@ -4,8 +4,25 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync/atomic"
 	"time"
 )
+
+// HotSampleEvery 热路径正文日志的采样间隔。每 N 条打一条，其余只计数。
+var (
+	HotSampleEvery uint64 = 1024
+	HotEvents      atomic.Uint64
+)
+
+// NoteHot 给热路径计数。返回 true 时这一条可以打正文日志。
+func NoteHot() bool {
+	n := HotEvents.Add(1)
+	every := HotSampleEvery
+	if every < 1 {
+		every = 1024
+	}
+	return n%every == 1
+}
 
 var (
 	// LogLevel 日志打印的级别
@@ -36,12 +53,9 @@ var (
 	Reset = string([]byte{27, 91, 48, 109})
 )
 
-// Recycling 回收SendMessage对象
+// Recycling 不再把对象放回池里。
+// 这条消息可能还在连接的发送队列中，放回去后下一次取出会改写同一块内存。
 func (s *SendMessage) Recycling() {
-	if s == nil {
-		return
-	}
-	sendPool.Put(s)
 }
 
 // Panic 记录一个Panic错误日志并回收SendMessage对象

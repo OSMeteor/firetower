@@ -4,9 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"sync/atomic"
 
 	"github.com/pkg/errors"
 )
+
+// DroppedFrames 是因为结果队列已满而丢掉的帧数。丢的是当前这一帧，后面的字节还会继续解析。
+var DroppedFrames atomic.Int64
 
 // 协议中用到的常量
 const (
@@ -152,7 +156,7 @@ func Depack(buffer []byte, readerChannel chan *SendMessage) ([]byte, error) {
 				select {
 				case readerChannel <- sendMessage:
 				default:
-					return nil, errors.New("result queue full")
+					DroppedFrames.Add(1)
 				}
 			}
 

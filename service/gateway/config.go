@@ -20,10 +20,9 @@ var (
 )
 
 func loadConfig(path string) {
-	var (
-		err error
-	)
-	if ConfigTree, err = toml.LoadFile(path); err != nil {
+	tree, err := toml.LoadFile(path)
+	if err != nil {
 		fmt.Println("config load failed:", err)
 	}
+	storeConfigTree(tree)
 }

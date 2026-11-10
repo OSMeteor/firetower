@@ -23,7 +23,7 @@ import (
 )
 
 func main() {
-	mode := flag.String("mode", "all", "nw04, lg, or all")
+	mode := flag.String("mode", "all", "nw04, lg, crash, or all")
 	conns := flag.Int("conns", 1000, "LG 连接数")
 	hold := flag.Duration("hold", 60*time.Second, "LG 稳态保持时间")
 	topicBin := flag.String("topic", "", "topic service 可执行文件")
@@ -46,6 +46,14 @@ func main() {
 			fmt.Printf("NW04 FAIL: %v\n", err)
 		} else {
 			fmt.Println("NW04 PASS")
+		}
+	}
+	if *mode == "crash" {
+		if err := runCrash(*topicBin, *gwBin); err != nil {
+			failed = true
+			fmt.Printf("CRASH FAIL: %v\n", err)
+		} else {
+			fmt.Println("CRASH PASS")
 		}
 	}
 	if *mode == "all" || *mode == "lg" {
@@ -135,7 +143,7 @@ ConsumerNum = 4
 		s.stop()
 		return nil, fmt.Errorf("topic grpc 没听上: %w\n%s", err, tail(s.tmLog))
 	}
-	env := append(os.Environ(), "FIRETOWER_HTTP="+s.http)
+	env := append(os.Environ(), "FIRETOWER_HTTP="+s.http, "FIRETOWER_PPROF=1")
 	s.gateway, err = startLogged(gwBin, dir, s.gwLog, env)
 	if err != nil {
 		s.stop()
@@ -260,6 +268,138 @@ func runNW04(topicBin, gwBin string) error {
 		return fmt.Errorf("TopicManager 恢复后 20 秒内新订阅没有成功: %v\n%s", last, tail(s.gwLog))
 	}
 	fmt.Printf("NW04 恢复耗时: %s\n", recovered)
+	sender, err := dialClient(s.http)
+	if err != nil {
+		return fmt.Errorf("恢复后无法建立发布连接: %w", err)
+	}
+	defer sender.close()
+	if err := sender.publish("nw04-room", map[string]string{"msg": "nw04-resume"}); err != nil {
+		return err
+	}
+	if err := b.waitContains("nw04-resume", 15*time.Second); err != nil {
+		return fmt.Errorf("原连接没有重订，Manager 恢复后没有再收到消息: %w\n%s\n%s", err, tail(s.gwLog), tail(s.tmLog))
+	}
+	fmt.Println("NW04 原连接在不重订的情况下恢复收消息")
+	return nil
+}
+
+func runCrash(topicBin, gwBin string) error {
+	fmt.Println("--- CRASH 坏帧不能打崩进程，Manager 连续重启 5 次后原连接仍能收消息 ---")
+	s, err := startStack(topicBin, gwBin)
+	if err != nil {
+		return err
+	}
+	defer s.stop()
+	defer os.RemoveAll(s.dir)
+	if s.gateway == nil || s.gateway.Process == nil {
+		return fmt.Errorf("Gateway 没有起来")
+	}
+	gwPID := s.gateway.Process.Pid
+
+	good, err := dialClient(s.http)
+	if err != nil {
+		return err
+	}
+	defer good.close()
+	if err := good.subscribe("crash-room"); err != nil {
+		return err
+	}
+	if err := good.waitContains("onSubscribe", 5*time.Second); err != nil {
+		return fmt.Errorf("基线订阅失败: %w\n%s", err, tail(s.gwLog))
+	}
+
+	bad := [][]byte{
+		[]byte("not-json"),
+		[]byte("null"),
+		[]byte(`{"type":"subscribe","topic":""}`),
+		[]byte(`{"type":"subscribe"}`),
+		[]byte(`{"type":"nope","topic":"crash-room","data":null}`),
+		[]byte(`{"type":"subscribe","topic":"` + strings.Repeat("t,", 3000) + `"}`),
+	}
+	for _, frame := range bad {
+		if err := poke(s.http, frame); err != nil {
+			return err
+		}
+	}
+	huge := bytes.Repeat([]byte("a"), 1<<20+64)
+	_ = poke(s.http, huge)
+	if err := stillUp(s.gateway, gwPID); err != nil {
+		return fmt.Errorf("坏帧之后 Gateway 不在了: %w\n%s", err, tail(s.gwLog))
+	}
+	if err := stillUp(s.topic, s.topic.Process.Pid); err != nil {
+		return fmt.Errorf("坏帧之后 TopicManager 不在了: %w\n%s", err, tail(s.tmLog))
+	}
+	if err := publishTo(s.http, "crash-room", "crash-ok"); err != nil {
+		return err
+	}
+	if err := good.waitContains("crash-ok", 5*time.Second); err != nil {
+		return fmt.Errorf("坏帧之后正常连接收不到消息: %w\n%s", err, tail(s.gwLog))
+	}
+	fmt.Println("CRASH 坏帧之后进程还在，正常连接仍能收消息")
+
+	for i := 1; i <= 5; i++ {
+		kill(s.topic)
+		waitExit(s.topic)
+		s.topic, err = startLogged(topicBin, s.dir, s.tmLog, nil)
+		if err != nil {
+			return err
+		}
+		if err := waitPort(fmt.Sprintf("127.0.0.1:%d", s.tcp), 10*time.Second); err != nil {
+			return fmt.Errorf("第 %d 次重启后 TopicManager 没起来: %w\n%s", i, err, tail(s.tmLog))
+		}
+		if err := stillUp(s.gateway, gwPID); err != nil {
+			return fmt.Errorf("第 %d 次重启后 Gateway 不在了: %w\n%s", i, err, tail(s.gwLog))
+		}
+		token := fmt.Sprintf("crash-r%d", i)
+		deadline := time.Now().Add(15 * time.Second)
+		var last error
+		for time.Now().Before(deadline) {
+			last = publishTo(s.http, "crash-room", token)
+			if last != nil {
+				time.Sleep(300 * time.Millisecond)
+				continue
+			}
+			last = good.waitContains(token, time.Second)
+			if last == nil {
+				break
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
+		if last != nil {
+			return fmt.Errorf("第 %d 次重启后原连接没有收到消息: %w\n%s\n%s", i, last, tail(s.gwLog), tail(s.tmLog))
+		}
+		fmt.Printf("CRASH 第 %d 次重启后原连接收到消息\n", i)
+	}
+	return nil
+}
+
+func poke(httpAddr string, payload []byte) error {
+	c, err := dialClient(httpAddr)
+	if err != nil {
+		return fmt.Errorf("坏帧连接失败，Gateway 可能已经退出: %w", err)
+	}
+	defer c.close()
+	_ = c.c.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	_ = c.c.WriteMessage(websocket.TextMessage, payload)
+	return nil
+}
+
+func publishTo(httpAddr, topic, msg string) error {
+	c, err := dialClient(httpAddr)
+	if err != nil {
+		return err
+	}
+	defer c.close()
+	return c.publish(topic, map[string]string{"msg": msg})
+}
+
+func stillUp(cmd *exec.Cmd, pid int) error {
+	if cmd == nil || cmd.Process == nil || cmd.Process.Pid != pid {
+		return fmt.Errorf("进程不在了")
+	}
+	if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
+		return fmt.Errorf("进程 %d 已退出", pid)
+	}
 	return nil
 }
 
@@ -563,10 +703,7 @@ func stuckGoroutines(httpAddr string) (string, string, error) {
 	blocks := strings.Split(body, "\n\n")
 	var stuck []string
 	for _, b := range blocks {
-		if !strings.Contains(b, " minutes") && !strings.Contains(b, " minute]") {
-			continue
-		}
-		if strings.Contains(b, "firetower") || strings.Contains(b, "grpc") {
+		if hungStack(b) {
 			stuck = append(stuck, b)
 		}
 	}
@@ -574,6 +711,31 @@ func stuckGoroutines(httpAddr string) (string, string, error) {
 		return "", body, nil
 	}
 	return strings.Join(stuck, "\n\n"), body, nil
+}
+
+// hungStack 只认关掉连接、订阅 RPC 或写 WebSocket 卡了至少一分钟。
+// 空闲的读循环、定时重放和 gRPC 内部队列在保持连接超过一分钟后也会显示 “1 minutes”，那不是故障。
+func hungStack(block string) bool {
+	if !strings.Contains(block, " minutes") && !strings.Contains(block, " minute]") {
+		return false
+	}
+	for _, name := range []string{
+		"unbindTopic",
+		"bindTopic",
+		"subscribeAll",
+		"unsubscribeAll",
+		"SubscribeTopic",
+		"UnSubscribeTopic",
+		"replayOnce",
+		"sendReplay",
+		"ClientConn).Invoke",
+	} {
+		if strings.Contains(block, name) {
+			return true
+		}
+	}
+	writing := strings.Contains(block, "syscall") || strings.Contains(block, "WriteMessage") || strings.Contains(block, "netFD")
+	return strings.Contains(block, "sendLoop") && writing
 }
 
 func summarize(profile string) string {

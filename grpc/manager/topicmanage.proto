@@ -37,6 +37,13 @@ message GetConnectNumResponse {
 message SubscribeTopicRequest {
     repeated string Topic = 1;
     string Ip = 2;
+    // Count 与 Version 和 Topic 一一对应。Version 为空时保持旧的 num++。
+    repeated int64 Count = 3;
+    repeated uint64 Version = 4;
+    // Round、RoundBegin、RoundEnd 只用于整表对账。都为空时仍按单次登记处理。
+    uint64 Round = 5;
+    bool RoundBegin = 6;
+    bool RoundEnd = 7;
 }
 
 message SubscribeTopicResponse {
@@ -46,6 +53,8 @@ message SubscribeTopicResponse {
 message UnSubscribeTopicRequest {
     repeated string Topic = 1;
     string Ip = 2;
+    repeated int64 Count = 3;
+    repeated uint64 Version = 4;
 }
 
 message UnSubscribeTopicResponse {

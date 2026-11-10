@@ -15,11 +15,11 @@ import (
 
 func TestAudit_DL01_CloseWhenUnsubscribeFails(t *testing.T) {
 	auditEnv(t)
-	topicManageGrpc = &scriptedTopic{
+	storeTopicGrpc(&scriptedTopic{
 		unsub: func(context.Context, *pb.UnSubscribeTopicRequest) (*pb.UnSubscribeTopicResponse, error) {
 			return nil, errors.New("unsubscribe failed")
 		},
-	}
+	})
 	ft := auditTower(t, "c1", "u1")
 
 	finishWithin(t, time.Second, "DL01 Close", func() { ft.Close() })
@@ -38,7 +38,7 @@ func TestAudit_DL02_BlockedRPCStillNotifiesClose(t *testing.T) {
 	auditEnv(t)
 	started := make(chan struct{})
 	finished := make(chan struct{})
-	topicManageGrpc = &scriptedTopic{
+	storeTopicGrpc(&scriptedTopic{
 		unsub: func(ctx context.Context, in *pb.UnSubscribeTopicRequest) (*pb.UnSubscribeTopicResponse, error) {
 			close(started)
 			select {
@@ -50,7 +50,7 @@ func TestAudit_DL02_BlockedRPCStillNotifiesClose(t *testing.T) {
 				return nil, errors.New("rpc leash expired")
 			}
 		},
-	}
+	})
 	ft := auditTower(t, "c1", "u1")
 
 	returned := make(chan struct{})
@@ -165,11 +165,11 @@ func TestAudit_DL04_ReentrantClose(t *testing.T) {
 		auditEnv(t)
 		ft := auditTower(t, "c1", "u1")
 		var called atomic.Bool
-		TowerLogger = func(target *FireTower, _, _ string) {
+		storeTowerLogger(func(target *FireTower, _, _ string) {
 			if target == ft && called.CompareAndSwap(false, true) {
 				ft.Close()
 			}
-		}
+		})
 		finishWithin(t, time.Second, "DL04 logger Close", func() { ft.Close() })
 		select {
 		case <-ft.closeChan:
@@ -235,11 +235,11 @@ func TestAudit_DL08_FullQueueLogCloses(t *testing.T) {
 	ft.sendOut = make(chan *socket.SendMessage, 1)
 	ft.sendOut <- &socket.SendMessage{}
 	bucket.AddSubscribe("room", ft)
-	TowerLogger = func(target *FireTower, kind, _ string) {
+	storeTowerLogger(func(target *FireTower, kind, _ string) {
 		if target == ft && kind == "WARN" {
 			ft.Close()
 		}
-	}
+	})
 
 	finishWithin(t, time.Second, "DL08 push", func() {
 		_ = bucket.push(&socket.SendMessage{Type: socket.PublishKey, Topic: "room", Data: []byte("x")})

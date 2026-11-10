@@ -18,7 +18,7 @@ var (
 
 func main() {
 	flag.Parse()
-	log.Printf("📢 STARTING BROADCAST SENDER 📢")
+	log.Printf("STARTING BROADCAST SENDER")
 	log.Printf("Target: %s | Topic: %s | Rate: %d/s", *targetAddr, *topic, *rate)
 
 	client := socket.NewClient(*targetAddr)
@@ -43,16 +43,12 @@ func main() {
 			return
 		case <-ticker.C:
 			data := []byte(fmt.Sprintf(`{"msg":"broadcast %d", "ts":%d}`, count, time.Now().UnixNano()))
-			// Publish(id, type, topic, data)
-			// id is arbitrary, "broadcast_bot"
-			// type "user" is standard
 			err := client.Publish("broadcast_bot", "user", *topic, data)
 			if err != nil {
 				log.Printf("Publish error: %v", err)
 			} else {
 				count++
 			}
-			
 			if count%1000 == 0 {
 				fmt.Printf("\rSent: %d", count)
 			}

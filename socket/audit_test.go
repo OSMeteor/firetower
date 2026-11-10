@@ -189,8 +189,8 @@ func TestAudit_TC01_ShutdownStopsOnPush(t *testing.T) {
 }
 
 func TestAudit_TC02_StaleReadDoesNotCloseNewConn(t *testing.T) {
-	previous := dialTCP
-	t.Cleanup(func() { dialTCP = previous })
+	previous := dialTCP.Load()
+	t.Cleanup(func() { dialTCP.Store(previous) })
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -210,7 +210,7 @@ func TestAudit_TC02_StaleReadDoesNotCloseNewConn(t *testing.T) {
 
 	releaseOldRead := make(chan struct{})
 	var dials atomic.Int32
-	dialTCP = func(network, address string) (net.Conn, error) {
+	dialTCP.Store(dialFunc(func(network, address string) (net.Conn, error) {
 		conn, err := net.Dial(network, address)
 		if err != nil {
 			return nil, err
@@ -219,7 +219,7 @@ func TestAudit_TC02_StaleReadDoesNotCloseNewConn(t *testing.T) {
 			return holdConn{Conn: conn, release: releaseOldRead}, nil
 		}
 		return conn, nil
-	}
+	}))
 
 	cli := NewClient(ln.Addr().String())
 	if err := cli.Connect(); err != nil {
@@ -288,13 +288,13 @@ func TestAudit_TC02_FlapDoesNotMultiplyGoroutines(t *testing.T) {
 }
 
 func TestAudit_TC02_ShutdownStopsReconnect(t *testing.T) {
-	previous := dialTCP
+	previous := dialTCP.Load()
 	var dials atomic.Int32
-	dialTCP = func(network, address string) (net.Conn, error) {
+	dialTCP.Store(dialFunc(func(network, address string) (net.Conn, error) {
 		dials.Add(1)
 		return nil, errors.New("offline")
-	}
-	t.Cleanup(func() { dialTCP = previous })
+	}))
+	t.Cleanup(func() { dialTCP.Store(previous) })
 
 	cli := NewClient("127.0.0.1:1")
 	go cli.Close()
@@ -331,6 +331,123 @@ func TestAudit_NilClientAndFrameDoNotPanic(t *testing.T) {
 	}
 }
 
+func TestAudit_FullQueueKeepsTheFollowingBytes(t *testing.T) {
+	one, err := Enpack("push", "1", "src", "room", []byte("one"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := Enpack("push", "2", "src", "room", []byte("two"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail := two[:5]
+	buf := append(append([]byte{}, one...), two...)
+	buf = append(buf, tail...)
+	before := DroppedFrames.Load()
+	ch := make(chan *SendMessage, 1)
+	rest, err := Depack(buf, ch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := DroppedFrames.Load() - before; got != 1 {
+		t.Fatalf("dropped frames = %d, want 1", got)
+	}
+	if len(ch) != 1 {
+		t.Fatalf("queued %d frames, want the first one", len(ch))
+	}
+	if !bytes.Equal(rest, tail) {
+		t.Fatalf("remainder = %q, want the unfinished tail", rest)
+	}
+	msg := <-ch
+	if string(msg.Data) != "one" {
+		t.Fatalf("kept frame data = %q", msg.Data)
+	}
+}
+
+func TestAudit_HeartbeatWaitIsNotPublishable(t *testing.T) {
+	client := &TcpClient{}
+	if !client.Publishable() {
+		t.Fatal("a manager that has not sent a heartbeat was treated as down")
+	}
+	if !client.noteControl(&SendMessage{Type: "heartbeat", Data: []byte("wait")}) || client.Publishable() {
+		t.Fatal("wait heartbeat did not take the manager out of the publish set")
+	}
+	if !client.noteControl(&SendMessage{Type: "heartbeat", Data: []byte("ready")}) || !client.Publishable() {
+		t.Fatal("ready heartbeat did not restore the manager")
+	}
+}
+
+func TestAudit_HotLogIsSampled(t *testing.T) {
+	prev := HotSampleEvery
+	HotSampleEvery = 10
+	t.Cleanup(func() { HotSampleEvery = prev })
+	var logged int
+	for i := 0; i < 10; i++ {
+		if NoteHot() {
+			logged++
+		}
+	}
+	if logged != 1 {
+		t.Fatalf("sampled %d of 10, want 1", logged)
+	}
+}
+
+func TestAudit_RetryDelayIsJitteredAndCapped(t *testing.T) {
+	seen := map[time.Duration]struct{}{}
+	for i := 0; i < 30; i++ {
+		d := retryDelay(20)
+		if d < dialCap/2 || d > dialCap {
+			t.Fatalf("capped delay %s outside [%s, %s]", d, dialCap/2, dialCap)
+		}
+		seen[d] = struct{}{}
+	}
+	if len(seen) < 2 {
+		t.Fatal("capped reconnect delay did not jitter")
+	}
+	base := retryDelay(0)
+	if base < dialBase/2 || base > dialBase {
+		t.Fatalf("first delay %s outside [%s, %s]", base, dialBase/2, dialBase)
+	}
+}
+
+func TestAudit_ReadTimeoutReplacesSilentManager(t *testing.T) {
+	prev := managerReadTimeout.Load()
+	managerReadTimeout.Store(int64(150 * time.Millisecond))
+	t.Cleanup(func() { managerReadTimeout.Store(prev) })
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	accepted := make(chan struct{}, 2)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			accepted <- struct{}{}
+			_ = conn
+		}
+	}()
+	cli := NewClient(ln.Addr().String())
+	if err := cli.Connect(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cli.Shutdown() })
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("first connection was not accepted")
+	}
+	select {
+	case <-accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("silent manager was not treated as disconnected")
+	}
+}
+
 type holdConn struct {
 	net.Conn
 	release <-chan struct{}
@@ -358,3 +475,72 @@ type panicError struct{ value any }
 func (e panicError) Error() string { return fmt.Sprintf("panic: %v", e.value) }
 
 func errPanic(v any) error { return panicError{value: v} }
+
+func TestAudit_RecyclingDoesNotAliasQueuedMessage(t *testing.T) {
+	msg := GetSendMessage("1", "user")
+	msg.Type = "publish"
+	msg.Topic = "room"
+	msg.Data = []byte("secret")
+	msg.Recycling()
+	next := GetSendMessage("2", "platform")
+	next.Type = "other"
+	next.Topic = "elsewhere"
+	next.Data = []byte("hijack")
+	if next == msg {
+		t.Fatal("pool handed back the message that is still queued")
+	}
+	if msg.Type != "publish" || msg.Topic != "room" || string(msg.Data) != "secret" {
+		t.Fatalf("queued message was overwritten: type=%q topic=%q data=%q", msg.Type, msg.Topic, msg.Data)
+	}
+}
+
+func TestAudit_OnPushContinuesAfterPanic(t *testing.T) {
+	c := NewClient("127.0.0.1:1")
+	c.closeChan = make(chan struct{})
+	var n atomic.Int32
+	c.OnPush(func(*SendMessage) {
+		if n.Add(1) == 1 {
+			panic("callback")
+		}
+	})
+	c.readIn <- &SendMessage{Type: "push"}
+	c.readIn <- &SendMessage{Type: "push"}
+	deadline := time.Now().Add(time.Second)
+	for n.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	c.mutex.Lock()
+	c.manualClose = true
+	stop := c.closeChan
+	c.mutex.Unlock()
+	close(stop)
+	if n.Load() < 2 {
+		t.Fatalf("OnPush stopped after a callback panic, delivered %d", n.Load())
+	}
+}
+
+func TestAudit_DialLoopRestartsAfterPanic(t *testing.T) {
+	prev := dialTCP.Load()
+	var calls atomic.Int32
+	dialTCP.Store(dialFunc(func(string, string) (net.Conn, error) {
+		if calls.Add(1) == 1 {
+			panic("dial")
+		}
+		return nil, errors.New("down")
+	}))
+	c := NewClient("127.0.0.1:1")
+	t.Cleanup(func() {
+		c.Shutdown()
+		dialTCP.Store(prev)
+	})
+	c.mutex.Lock()
+	c.startDialLocked()
+	c.mutex.Unlock()
+	deadline := time.Now().Add(3 * time.Second)
+	for calls.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if calls.Load() < 2 {
+		t.Fatalf("dial loop did not restart after panic, calls=%d", calls.Load())
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	pb "github.com/OSMeteor/firetower/grpc/manager"
@@ -35,11 +36,32 @@ var (
 	IdWorker *snowFlakeByGo.Worker
 )
 
+// GetTopicManage 返回连接池里的第一台，供旧调用方使用。新代码走连接池。
 func GetTopicManage() *socket.TcpClient {
-	return topicManage
+	poolMu.RLock()
+	var tcp *socket.TcpClient
+	if len(pool) > 0 && pool[0] != nil {
+		tcp = pool[0].tcp
+	}
+	poolMu.RUnlock()
+	if tcp != nil {
+		return tcp
+	}
+	return loadTopicManage()
 }
+
+// GetTopicManageGrpc 返回连接池里的第一台，供旧调用方使用。新代码走连接池。
 func GetTopicManageGrpc() pb.TopicServiceClient {
-	return topicManageGrpc
+	poolMu.RLock()
+	var rpc pb.TopicServiceClient
+	if len(pool) > 0 && pool[0] != nil {
+		rpc = pool[0].rpc
+	}
+	poolMu.RUnlock()
+	if rpc != nil {
+		return rpc
+	}
+	return loadTopicGrpc()
 }
 
 // FireInfo 接收的消息结构体
@@ -87,26 +109,24 @@ func (f *FireInfo) Panic(info string) {
 	if f == nil {
 		return
 	}
-	if FireLogger != nil {
-		FireLogger(f, "Panic", info)
-	}
+	callFireLogger(f, "Panic", info)
 	f.Recycling()
 }
 
 // Info 记录一个INFO级别的日志
 func (f *FireInfo) Info(info string) {
-	if f == nil || FireLogger == nil {
+	if f == nil {
 		return
 	}
-	FireLogger(f, "INFO", info)
+	callFireLogger(f, "INFO", info)
 }
 
 // Error 记录一个ERROR级别的日志
 func (f *FireInfo) Error(info string) {
-	if f == nil || FireLogger == nil {
+	if f == nil {
 		return
 	}
-	FireLogger(f, "ERROR", info)
+	callFireLogger(f, "ERROR", info)
 }
 
 // FireLife 客户端推送消息的结构体
@@ -123,8 +143,8 @@ func (f *FireLife) reset(t *FireTower) {
 		return
 	}
 	f.startTime = time.Now()
-	if IdWorker != nil {
-		f.id = strconv.FormatInt(IdWorker.GetId(), 10)
+	if worker := loadIDWorker(); worker != nil {
+		f.id = strconv.FormatInt(worker.GetId(), 10)
 	} else {
 		f.id = strconv.FormatInt(time.Now().UnixNano(), 10)
 	}
@@ -146,7 +166,8 @@ type FireTower struct {
 	readIn    chan *FireInfo           // 读取队列
 	sendOut   chan *socket.SendMessage // 发送队列
 	ws        *websocket.Conn          // 保存底层websocket连接
-	topic     map[string]bool          // 订阅topic列表
+	topic     map[string]bool          // 客户端看到的 topic
+	route     map[string]string        // 客户端 topic → 登记到 Manager 的键。未分组时两者相同
 	isClose   bool                     // 判断当前websocket是否被关闭
 	closeChan chan struct{}            // 用来作为关闭websocket的触发点
 	mutex     sync.Mutex               // 避免并发close chan
@@ -159,27 +180,42 @@ type FireTower struct {
 	unSubscribeHandler     func(context *FireLife, topic []string) bool
 	beforeSubscribeHandler func(context *FireLife, topic []string) ([]string, bool)
 	onSystemRemove         func(topic string)
+	subscribeFailHandler   func(topics []string, err error)
+	counted                bool
+	gapHints               atomic.Bool
+	gapWake                chan struct{}
+	gapMu                  sync.Mutex
+	gaps                   map[string]struct{}
+	passive                map[string]bool
 }
+
+var liveConns atomic.Int64
 
 // Init 初始化firetower
 // 在调用firetower前请一定要先调用Init方法
 // Init 初始化firetower
 // 在调用firetower前请一定要先调用Init方法
 func Init() {
-	IdWorker, _ = snowFlakeByGo.NewWorker(ClusterId)
+	worker, _ := snowFlakeByGo.NewWorker(ClusterId)
+	storeIDWorker(worker)
 
-	TowerLogger = towerLog
-	FireLogger = fireLog
+	storeTowerLogger(towerLog)
+	storeFireLogger(fireLog)
 
 	loadConfig(DefaultConfigPath) // 加载配置
-	buildBuckets()                // 构建服务架构
-	buildManagerClient()          // 构建连接manager(topic管理服务)的客户端
+	loadGroups(loadConfigTree())
+	buildBuckets()       // 构建服务架构
+	buildManagerClient() // 构建连接manager(topic管理服务)的客户端
 }
 
 // BuildTower 实例化一个websocket客户端
 func BuildTower(ws *websocket.Conn, clientId string) (tower *FireTower) {
-	if topicManageGrpc == nil {
+	if loadTopicGrpc() == nil {
 		towerLog(nil, "ERROR", "please confirm gateway was inited")
+		return nil
+	}
+	if draining.Load() {
+		towerLog(nil, "ERROR", "gateway is draining")
 		return nil
 	}
 
@@ -187,8 +223,67 @@ func BuildTower(ws *websocket.Conn, clientId string) (tower *FireTower) {
 		towerLog(nil, "ERROR", "websocket.Conn is nil")
 		return nil
 	}
+	if !reserveConn() {
+		towerLog(nil, "ERROR", "connection limit reached")
+		return nil
+	}
 	tower = buildNewTower(ws, clientId)
+	tower.counted = true
+	liveTowers.Store(tower.connId, tower)
 	return
+}
+
+var (
+	draining   atomic.Bool
+	liveTowers sync.Map
+)
+
+// Drain 停止接入，再按批关闭已经在线上的连接。客户端会断开并自行重连。
+func Drain(batch int, pause time.Duration) {
+	draining.Store(true)
+	if batch < 1 {
+		batch = 32
+	}
+	var group []*FireTower
+	liveTowers.Range(func(_, value any) bool {
+		ft, _ := value.(*FireTower)
+		if ft != nil {
+			group = append(group, ft)
+		}
+		return true
+	})
+	for i := 0; i < len(group); {
+		j := i + batch
+		if j > len(group) {
+			j = len(group)
+		}
+		for _, ft := range group[i:j] {
+			ft.Close()
+		}
+		i = j
+		if pause > 0 && i < len(group) {
+			time.Sleep(pause)
+		}
+	}
+}
+
+func reserveConn() bool {
+	limit := int64(maxConnections())
+	for {
+		cur := liveConns.Load()
+		if cur >= limit {
+			return false
+		}
+		if liveConns.CompareAndSwap(cur, cur+1) {
+			pct := int64(configInt("warn.connectionPercent", 70))
+			warnCapacity("connections", cur+1, limit*pct/100, "add gateway")
+			return true
+		}
+	}
+}
+
+func releaseConn() {
+	liveConns.Add(-1)
 }
 
 func buildNewTower(ws *websocket.Conn, clientId string) *FireTower {
@@ -202,6 +297,7 @@ func buildNewTower(ws *websocket.Conn, clientId string) *FireTower {
 	t.ws = ws
 	t.isClose = false
 	t.closeChan = make(chan struct{})
+	t.gapWake = make(chan struct{}, 1)
 
 	t.readHandler = nil
 	t.readTimeoutHandler = nil
@@ -234,20 +330,21 @@ func (t *FireTower) Run() {
 }
 
 func managerIP() (string, error) {
-	if topicManageGrpc == nil {
+	manage, grpcClient := loadTopicClients()
+	if grpcClient == nil {
 		return "", errors.New("topicManageGrpc is nil")
 	}
-	if topicManage == nil {
+	if manage == nil {
 		return "", errors.New("topicManage is nil")
 	}
-	if topicManage.Conn == nil {
+	if key := manage.RouteKey(); key != "" {
+		return key, nil
+	}
+	addr := manage.CurrentAddr()
+	if addr == "" {
 		return "", errors.New("topicManage.Conn is nil")
 	}
-	addr := topicManage.Conn.LocalAddr()
-	if addr == nil || addr.Network() == "" || addr.String() == "" {
-		return "", errors.New("topicManage.Conn is nil")
-	}
-	return addr.String(), nil
+	return addr, nil
 }
 
 // 订阅topic的绑定过程
@@ -256,14 +353,12 @@ func (t *FireTower) bindTopic(topic []string) ([]string, error) {
 	if t == nil {
 		return addTopic, errors.New("t is nil")
 	}
-	if TM == nil {
+	attachReplay()
+	tm := loadTM()
+	if tm == nil {
 		return addTopic, errors.New("TM is nil")
 	}
-	ip, err := managerIP()
-	if err != nil {
-		return addTopic, err
-	}
-	bucket := TM.GetBucket(t)
+	bucket := tm.GetBucket(t)
 	if bucket == nil {
 		return addTopic, errors.New("bucket is nil")
 	}
@@ -275,35 +370,61 @@ func (t *FireTower) bindTopic(topic []string) ([]string, error) {
 	if t.topic == nil {
 		t.topic = make(map[string]bool)
 	}
+	room := maxTopicsPerConn()
+	seen := make(map[string]struct{}, len(topic))
+	var pending []string
 	for _, v := range topic {
 		if v == "" {
 			continue
 		}
-		if _, ok := t.topic[v]; !ok {
-			addTopic = append(addTopic, v)
-			t.topic[v] = true
+		if _, ok := t.topic[v]; ok {
+			continue
 		}
+		if _, dup := seen[v]; dup {
+			continue
+		}
+		seen[v] = struct{}{}
+		pending = append(pending, v)
+	}
+	if len(t.topic)+len(pending) > room {
+		t.mutex.Unlock()
+		return addTopic, errors.New("too many topics on this connection")
+	}
+	for _, v := range pending {
+		addTopic = append(addTopic, v)
 	}
 	t.mutex.Unlock()
-	for _, v := range addTopic {
-		bucket.AddSubscribe(v, t)
-	}
 	if len(addTopic) == 0 {
 		return addTopic, nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), managerRPCTimeout)
-	defer cancel()
-	_, err = topicManageGrpc.SubscribeTopic(ctx, &pb.SubscribeTopicRequest{Topic: addTopic, Ip: ip})
-	if err != nil {
-		t.mutex.Lock()
-		for _, v := range addTopic {
-			delete(t.topic, v)
-		}
-		t.mutex.Unlock()
-		for _, v := range addTopic {
-			bucket.DelSubscribe(v, t)
+	routes := make([]string, len(addTopic))
+	for i, name := range addTopic {
+		routes[i] = registerKey(name, shardUser(t))
+	}
+	counts, versions := noteSubscribe(routes)
+	if err := subscribeAll(routes, counts, versions); err != nil {
+		revertSubscribe(routes)
+		if t.subscribeFailHandler != nil {
+			t.subscribeFailHandler(addTopic, err)
 		}
 		return addTopic, err
+	}
+	t.mutex.Lock()
+	if t.isClose {
+		t.mutex.Unlock()
+		revertSubscribe(routes)
+		return addTopic, ErrorClose
+	}
+	if t.route == nil {
+		t.route = make(map[string]string, len(addTopic))
+	}
+	for i, name := range addTopic {
+		t.topic[name] = true
+		t.route[name] = routes[i]
+	}
+	t.mutex.Unlock()
+	for _, key := range routes {
+		bucket.AddSubscribe(key, t)
 	}
 	return addTopic, nil
 }
@@ -313,34 +434,57 @@ func (t *FireTower) unbindTopic(topic []string) ([]string, error) {
 	if t == nil {
 		return delTopic, errors.New("t is nil")
 	}
-	if TM == nil {
+	attachReplay()
+	tm := loadTM()
+	if tm == nil {
 		return delTopic, errors.New("TM is nil")
 	}
-	bucket := TM.GetBucket(t)
+	bucket := tm.GetBucket(t)
+	var delRoute []string
 	t.mutex.Lock()
 	for _, v := range topic {
-		if t.topic != nil && t.topic[v] {
-			delTopic = append(delTopic, v)
-			delete(t.topic, v)
+		client, route, ok := t.takeTopicLocked(v)
+		if !ok {
+			continue
 		}
+		delTopic = append(delTopic, client)
+		delRoute = append(delRoute, route)
 	}
 	t.mutex.Unlock()
 	if bucket != nil {
-		for _, v := range delTopic {
-			bucket.DelSubscribe(v, t)
+		for _, key := range delRoute {
+			bucket.DelSubscribe(key, t)
 		}
 	}
 	if len(delTopic) == 0 {
 		return delTopic, nil
 	}
-	ip, err := managerIP()
-	if err != nil {
-		return delTopic, err
+	counts, versions := noteUnsubscribe(delRoute)
+	return delTopic, unsubscribeAll(delRoute, counts, versions)
+}
+
+func (t *FireTower) takeTopicLocked(name string) (client, route string, ok bool) {
+	if t == nil || name == "" || t.topic == nil {
+		return "", "", false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), managerRPCTimeout)
-	defer cancel()
-	_, err = topicManageGrpc.UnSubscribeTopic(ctx, &pb.UnSubscribeTopicRequest{Topic: delTopic, Ip: ip})
-	return delTopic, err
+	if t.topic[name] {
+		route = name
+		if t.route != nil && t.route[name] != "" {
+			route = t.route[name]
+		}
+		delete(t.topic, name)
+		delete(t.route, name)
+		return name, route, true
+	}
+	for client, route := range t.route {
+		if route != name {
+			continue
+		}
+		delete(t.topic, client)
+		delete(t.route, client)
+		return client, route, true
+	}
+	return "", "", false
 }
 
 func (t *FireTower) read() (*FireInfo, error) {
@@ -380,19 +524,159 @@ func (t *FireTower) Send(message *socket.SendMessage) error {
 	}
 	ch := t.sendOut
 	t.mutex.Unlock()
-	// 非阻塞发送，防止慢消费者阻塞整个 Bucket 的分发
+	// 正文在进入 Bucket 时已经复制过。这里只复制结构体，一万人的房间不用再分配一万份正文。
+	cloned := *message
+	if message.Context != nil {
+		life := *message.Context
+		cloned.Context = &life
+	}
+	message = &cloned
+	// 非阻塞发送，防止慢消费者阻塞整个 Bucket 的分发。
+	// 向已关闭的队列发送会 panic，这里接住，只丢掉这一条。
+	if err := enqueueSend(ch, message); err != nil {
+		noteSendDrop(t)
+		if message.Type != socket.StateKey {
+			t.noteGap(parentTopic(message.Topic))
+		}
+		return err
+	}
+	return nil
+}
+
+func enqueueSend(ch chan *socket.SendMessage, message *socket.SendMessage) (err error) {
+	defer func() {
+		if recover() != nil {
+			err = errors.New("send channel closed")
+		}
+	}()
 	select {
 	case ch <- message:
 		return nil
 	default:
-		// 缓冲区满，丢弃消息，防止阻塞上游
-		// 在生产环境中，这里应该增加一个 Metric 指标，记录丢弃的消息数量
-		if TowerLogger != nil {
-			TowerLogger(t, "WARN", "send buffer full, message dropped")
-		}
-		// 返回错误让上层知道发送失败
 		return errors.New("send buffer full")
 	}
+}
+
+// EnableGapHints 打开缺失提示。默认关闭，现有客户端不会收到新的帧。
+func (t *FireTower) EnableGapHints() {
+	if t == nil {
+		return
+	}
+	t.gapHints.Store(true)
+	if t.gapWake == nil {
+		t.gapWake = make(chan struct{}, 1)
+	}
+}
+
+// SetPassive 把这条连接在该 Topic 上标成被动。被动连接不收状态事件，业务消息照旧。默认是主动。
+func (t *FireTower) SetPassive(topic string, on bool) {
+	if t == nil || topic == "" {
+		return
+	}
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	if t.passive == nil {
+		t.passive = map[string]bool{}
+	}
+	if on {
+		t.passive[topic] = true
+	} else {
+		delete(t.passive, topic)
+	}
+}
+
+func (t *FireTower) passiveTopic(topic string) bool {
+	if t == nil {
+		return false
+	}
+	t.mutex.Lock()
+	defer t.mutex.Unlock()
+	if t.passive[topic] {
+		return true
+	}
+	parent := parentTopic(topic)
+	return parent != topic && t.passive[parent]
+}
+
+func (t *FireTower) noteGap(topic string) {
+	if t == nil || topic == "" || !t.gapHints.Load() {
+		return
+	}
+	t.gapMu.Lock()
+	if t.gaps == nil {
+		t.gaps = map[string]struct{}{}
+	}
+	_, existed := t.gaps[topic]
+	t.gaps[topic] = struct{}{}
+	wake := t.gapWake
+	t.gapMu.Unlock()
+	if existed || wake == nil {
+		return
+	}
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
+}
+
+func (t *FireTower) flushGap() {
+	if t == nil || !t.gapHints.Load() || t.ws == nil {
+		return
+	}
+	t.gapMu.Lock()
+	var topic string
+	for k := range t.gaps {
+		topic = k
+		delete(t.gaps, k)
+		break
+	}
+	more := len(t.gaps) > 0
+	wake := t.gapWake
+	t.gapMu.Unlock()
+	if topic == "" {
+		return
+	}
+	body, err := json.Marshal(map[string]string{"type": "gap", "topic": topic})
+	if err != nil {
+		return
+	}
+	_ = t.ws.SetWriteDeadline(time.Now().Add(3 * time.Second))
+	_ = t.ws.WriteMessage(websocket.TextMessage, body)
+	if more && wake != nil {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func cloneSendMessage(message *socket.SendMessage) *socket.SendMessage {
+	if message == nil {
+		return nil
+	}
+	cloned := *message
+	if message.Context != nil {
+		life := *message.Context
+		cloned.Context = &life
+	}
+	if message.Data != nil {
+		cloned.Data = append([]byte(nil), message.Data...)
+	}
+	return &cloned
+}
+
+var lastDropLog atomic.Int64
+
+var sendDrops atomic.Int64
+
+func noteSendDrop(t *FireTower) {
+	sendDrops.Add(1)
+	now := time.Now().UnixNano()
+	prev := lastDropLog.Load()
+	if now-prev < int64(time.Second) || !lastDropLog.CompareAndSwap(prev, now) {
+		return
+	}
+	callTowerLogger(t, "WARN", "send buffer full, message dropped")
 }
 
 // Close 关闭客户端连接并注销
@@ -407,6 +691,9 @@ func (t *FireTower) Close() {
 		return
 	}
 	t.isClose = true
+	liveTowers.Delete(t.connId)
+	counted := t.counted
+	t.counted = false
 	var topics []string
 	for k := range t.topic {
 		topics = append(topics, k)
@@ -416,6 +703,9 @@ func (t *FireTower) Close() {
 	offline := t.onOfflineHandler
 	unsub := t.unSubscribeHandler
 	t.mutex.Unlock()
+	if counted {
+		releaseConn()
+	}
 
 	// 先断开连接并唤醒读写协程，再做 RPC。RPC 失败或回调重入都不能把协程留住。
 	if ws != nil {
@@ -469,10 +759,11 @@ func (t *FireTower) sendLoop() {
 				message.Panic(fmt.Sprintf("set write deadline failed: %v", err))
 				goto collapse
 			}
-			if message.MessageType == 0 {
-				message.MessageType = 1 // 文本格式
+			kind := message.MessageType
+			if kind == 0 {
+				kind = websocket.TextMessage
 			}
-			if err := t.ws.WriteMessage(message.MessageType, []byte(message.Data)); err != nil {
+			if err := t.ws.WriteMessage(kind, message.Data); err != nil {
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 					message.Info(fmt.Sprintf("websocket closed while sending: %v", err))
 				} else {
@@ -480,10 +771,14 @@ func (t *FireTower) sendLoop() {
 				}
 				goto collapse
 			}
+			t.flushGap()
+		case <-t.gapWake:
+			t.flushGap()
 		case <-heartTicker.C:
 			if t.ws == nil {
 				goto collapse
 			}
+			// 协议层 Ping，不进入业务消息。队列满也不会因为心跳关掉连接。
 			if err := t.ws.WriteControl(websocket.PingMessage, []byte("ping"), time.Now().Add(time.Second)); err != nil {
 				towerLog(t, "ERROR", fmt.Sprintf("heartbeat ping failed: %v", err))
 				goto collapse
@@ -562,15 +857,18 @@ func (t *FireTower) readDispose() {
 				fire.Panic(fmt.Sprintf("read message failed:%v", err))
 			} else {
 				// Manually log if fire is nil
-				if TowerLogger != nil {
-					TowerLogger(t, "ERROR", fmt.Sprintf("read message failed:%v", err))
-				}
+				callTowerLogger(t, "ERROR", fmt.Sprintf("read message failed:%v", err))
 			}
 			t.Close()
 			return
-		} else if t.isClose {
+		}
+		t.mutex.Lock()
+		closed := t.isClose
+		t.mutex.Unlock()
+		if closed {
 			return
-		} else {
+		}
+		{
 			if fire == nil || fire.Message == nil {
 				continue
 			}
@@ -580,13 +878,22 @@ func (t *FireTower) readDispose() {
 			}
 			switch fire.Message.Type {
 			case "subscribe": // 客户端订阅topic
-				addTopic := strings.Split(fire.Message.Topic, ",")
-				// 如果设置了订阅前触发事件则调用
+				addTopic, ok := splitTopics(fire.Message.Topic, maxTopicsPerFrame())
+				if !ok {
+					fire.Error("too many topics in one frame")
+					fire.Recycling()
+					continue
+				}
 				// 如果设置了订阅前触发事件则调用
 				if t.beforeSubscribeHandler != nil {
-					var ok bool
-					addTopic, ok = t.beforeSubscribeHandler(fire.Context, addTopic)
-					if !ok {
+					var allow bool
+					addTopic, allow = t.beforeSubscribeHandler(fire.Context, addTopic)
+					if !allow {
+						continue
+					}
+					if len(addTopic) > maxTopicsPerFrame() {
+						fire.Error("too many topics in one frame")
+						fire.Recycling()
 						continue
 					}
 				}
@@ -598,7 +905,12 @@ func (t *FireTower) readDispose() {
 					t.subscribeHandler(fire.Context, addTopic)
 				}
 			case "unSubscribe": // 客户端取消订阅topic
-				delTopic := strings.Split(fire.Message.Topic, ",")
+				delTopic, ok := splitTopics(fire.Message.Topic, maxTopicsPerFrame())
+				if !ok {
+					fire.Error("too many topics in one frame")
+					fire.Recycling()
+					continue
+				}
 				delTopic, err = t.unbindTopic(delTopic)
 				if err != nil {
 					fire.Error(err.Error())
@@ -615,7 +927,9 @@ func (t *FireTower) readDispose() {
 					}
 				}
 			}
-			fire.Info("Extinguished")
+			if socket.NoteHot() {
+				fire.Info("Extinguished")
+			}
 			fire.Recycling()
 		}
 	}
@@ -624,20 +938,34 @@ func (t *FireTower) readDispose() {
 // Publish 推送接口
 // 通过BuildTower生成的实例都可以调用该方法来达到推送的目的
 func (t *FireTower) Publish(fire *FireInfo) error {
-	err := topicManage.Publish(fire.Context.id, "user", fire.Message.Topic, fire.Message.Data)
-	if err != nil {
-		fire.Panic(fmt.Sprintf("publish err: %v", err))
-		return err
+	if fire == nil || fire.Context == nil || fire.Message == nil {
+		return errors.New("empty publish")
 	}
-	return nil
+	var first error
+	for _, key := range publishKeys(fire.Message.Topic) {
+		link := pickPublisher(key)
+		if link == nil || link.tcp == nil {
+			if first == nil {
+				first = errors.New("topicManage is nil")
+			}
+			continue
+		}
+		if err := link.tcp.Publish(fire.Context.id, "user", key, fire.Message.Data); err != nil {
+			fire.Panic(fmt.Sprintf("publish err: %v", err))
+			if first == nil {
+				first = err
+			}
+		}
+	}
+	return first
 }
 func (f *FireInfo) GetContextId() string {
 	if f == nil || f.Context == nil {
 		return ""
 	}
 	if strings.TrimSpace(f.Context.id) == "" {
-		if IdWorker != nil {
-			f.Context.id = strconv.FormatInt(IdWorker.GetId(), 10)
+		if worker := loadIDWorker(); worker != nil {
+			f.Context.id = strconv.FormatInt(worker.GetId(), 10)
 		} else {
 			f.Context.id = strconv.FormatInt(time.Now().UnixNano(), 10)
 		}
@@ -646,10 +974,11 @@ func (f *FireInfo) GetContextId() string {
 }
 
 func configInt(key string, fallback int) int {
-	if ConfigTree == nil {
+	tree := loadConfigTree()
+	if tree == nil {
 		return fallback
 	}
-	v, ok := ConfigTree.Get(key).(int64)
+	v, ok := tree.Get(key).(int64)
 	if !ok || v <= 0 {
 		return fallback
 	}
@@ -658,6 +987,36 @@ func configInt(key string, fallback int) int {
 
 func heartbeatInterval() time.Duration {
 	return time.Duration(configInt("heartbeat", 30)) * time.Second
+}
+
+func maxTopicsPerFrame() int { return configInt("maxTopicsPerFrame", 1024) }
+
+func maxTopicsPerConn() int { return configInt("maxTopicsPerConn", 4096) }
+
+func maxConnections() int { return configInt("maxConnections", 100000) }
+
+// splitTopics 按逗号拆 Topic。超过 limit 时停止，不把整帧拆成几十万个字符串。
+func splitTopics(raw string, limit int) ([]string, bool) {
+	if limit <= 0 {
+		limit = 1024
+	}
+	out := make([]string, 0, 8)
+	start := 0
+	for i := 0; i <= len(raw); i++ {
+		if i != len(raw) && raw[i] != ',' {
+			continue
+		}
+		part := raw[start:i]
+		start = i + 1
+		if part == "" {
+			continue
+		}
+		if len(out) >= limit {
+			return nil, false
+		}
+		out = append(out, part)
+	}
+	return out, true
 }
 
 const managerRPCTimeout = 500 * time.Millisecond
@@ -674,10 +1033,16 @@ func readWait() time.Duration {
 // 这里描述一下使用场景
 // 只针对当前客户端进行的推送请调用该方法
 func (t *FireTower) ToSelf(b []byte) error {
-	if t == nil || t.ws == nil || t.isClose {
+	if t == nil {
 		return ErrorClose
 	}
-	return t.ws.WriteMessage(websocket.TextMessage, b)
+	// 只能由 sendLoop 写 WebSocket。这里入队，避免和发送循环并发写导致进程 panic。
+	message := socket.GetSendMessage("0", "self")
+	message.MessageType = websocket.TextMessage
+	if b != nil {
+		message.Data = append([]byte(nil), b...)
+	}
+	return t.Send(message)
 }
 
 func safeClose(t *FireTower) {
@@ -690,63 +1055,127 @@ func safeClose(t *FireTower) {
 
 // CheckTopicExist 检测topic是否已经有人订阅
 func (t *FireTower) CheckTopicExist(topic string) bool {
-	res, err := topicManageGrpc.CheckTopicExist(context.Background(), &pb.CheckTopicExistRequest{Topic: topic})
-	if err != nil {
+	if topic == "" {
 		return false
 	}
-	return res.Ok
+	for _, key := range publishKeys(topic) {
+		client := rpcFor(key)
+		if client == nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), managerRPCTimeout)
+		res, err := client.CheckTopicExist(ctx, &pb.CheckTopicExistRequest{Topic: key})
+		cancel()
+		if err == nil && res != nil && res.Ok {
+			return true
+		}
+	}
+	return false
+}
+
+func rpcFor(topic string) pb.TopicServiceClient {
+	link := pickPublisher(topic)
+	if link != nil && link.rpc != nil {
+		return link.rpc
+	}
+	return loadTopicGrpc()
 }
 
 // SetOnConnectHandler 建立连接事件
 func (t *FireTower) SetOnConnectHandler(fn func() bool) {
+	if t == nil {
+		return
+	}
 	t.onConnectHandler = fn
 }
 
 // SetOnOfflineHandler 用户连接关闭时触发
 func (t *FireTower) SetOnOfflineHandler(fn func()) {
+	if t == nil {
+		return
+	}
 	t.onOfflineHandler = fn
 }
 
 // SetReadHandler 客户端推送事件
 // 接收到用户publish的消息时触发
 func (t *FireTower) SetReadHandler(fn func(*FireInfo) bool) {
+	if t == nil {
+		return
+	}
 	t.readHandler = fn
 }
 
 // SetSubscribeHandler 订阅事件
 // 用户订阅topic后触发
 func (t *FireTower) SetSubscribeHandler(fn func(context *FireLife, topic []string) bool) {
+	if t == nil {
+		return
+	}
 	t.subscribeHandler = fn
 }
 
 // SetUnSubscribeHandler 取消订阅事件
 // 用户取消订阅topic后触发
 func (t *FireTower) SetUnSubscribeHandler(fn func(context *FireLife, topic []string) bool) {
+	if t == nil {
+		return
+	}
 	t.unSubscribeHandler = fn
 }
 
 // SetBeforeSubscribeHandler 订阅前回调事件
 // 用户订阅topic前触发
 func (t *FireTower) SetBeforeSubscribeHandler(fn func(context *FireLife, topic []string) ([]string, bool)) {
+	if t == nil {
+		return
+	}
 	t.beforeSubscribeHandler = fn
 }
 
 // SetReadTimeoutHandler 超时回调
 // readIn channal写满了  生产 > 消费的情况下触发超时机制
 func (t *FireTower) SetReadTimeoutHandler(fn func(*FireInfo)) {
+	if t == nil {
+		return
+	}
 	t.readTimeoutHandler = fn
 }
 
 // SetOnSystemRemove 系统移除某个用户的topic订阅
 func (t *FireTower) SetOnSystemRemove(fn func(topic string)) {
+	if t == nil {
+		return
+	}
 	t.onSystemRemove = fn
+}
+
+// SetSubscribeFailHandler 订阅登记失败时通知接入进程。不设置时只记日志，连接和帧格式不变。
+func (t *FireTower) SetSubscribeFailHandler(fn func(topics []string, err error)) {
+	if t == nil {
+		return
+	}
+	t.subscribeFailHandler = fn
 }
 
 // GetConnectNum 获取话题订阅数的grpc方法封装
 func (t *FireTower) GetConnectNum(topic string) int64 {
-	res, err := topicManageGrpc.GetConnectNum(context.Background(), &pb.GetConnectNumRequest{Topic: topic})
-	if err != nil {
+	if topic == "" {
 		return 0
 	}
-	return res.Number
+	var sum int64
+	for _, key := range publishKeys(topic) {
+		client := rpcFor(key)
+		if client == nil {
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), managerRPCTimeout)
+		res, err := client.GetConnectNum(ctx, &pb.GetConnectNumRequest{Topic: key})
+		cancel()
+		if err != nil || res == nil {
+			continue
+		}
+		sum += res.Number
+	}
+	return sum
 }

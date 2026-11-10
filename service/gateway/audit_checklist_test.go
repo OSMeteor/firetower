@@ -18,55 +18,58 @@ import (
 )
 
 func TestAudit_FT03_QueuedMessageKeepsPayload(t *testing.T) {
-	oldConfig := ConfigTree
+	oldConfig := loadConfigTree()
 	t.Cleanup(func() {
-		TM = &TowerManager{
+		storeTM(&TowerManager{
 			bucket:      []*Bucket{{BuffChan: make(chan *socket.SendMessage, 4)}},
 			centralChan: make(chan *socket.SendMessage),
-		}
-		ConfigTree = oldConfig
+		})
+		storeConfigTree(oldConfig)
 	})
 	loadAuditConfig(t, 3600, 4, 1, 1)
 	buildBuckets()
+	tm := loadTM()
 
 	client := newMockTower("payload", 4)
-	TM.bucket[0].AddSubscribe("room", client)
-	TM.bucket[0].mu.Lock()
-	unlocked := false
-	t.Cleanup(func() {
-		if !unlocked {
-			TM.bucket[0].mu.Unlock()
-		}
-	})
+	tm.bucket[0].AddSubscribe("room", client)
 
 	msg := socket.GetSendMessage("ft03-own", "audit")
 	msg.Type = socket.PublishKey
 	msg.Topic = "room"
 	msg.Data = []byte("original-payload")
 	select {
-	case TM.centralChan <- msg:
+	case tm.centralChan <- msg:
 	case <-time.After(time.Second):
 		t.Fatal("FT-03: central enqueue blocked")
 	}
-	deadline := time.After(time.Second)
-	for len(TM.bucket[0].BuffChan) != 0 {
-		select {
-		case <-deadline:
-			t.Fatal("FT-03: bucket did not take the queued message")
-		case <-time.After(5 * time.Millisecond):
-		}
-	}
-	msg.Data = []byte("hijacked-payload")
-	TM.bucket[0].mu.Unlock()
-	unlocked = true
-
+	var got *socket.SendMessage
 	select {
-	case got := <-client.sendOut:
-		if string(got.Data) != "original-payload" {
-			t.Fatalf("FT-03: queued message changed after it was handed to the bucket: %q", got.Data)
-		}
+	case got = <-client.sendOut:
 	case <-time.After(time.Second):
 		t.Fatal("FT-03: subscriber did not receive the queued message")
+	}
+	// dispatch 只有一个协程，且会按桶逐个复制原消息。下一条已经被这个订阅者收到，
+	// 才说明上一条的复制已经结束，这时再改写原消息。
+	follow := socket.GetSendMessage("ft03-follow", "audit")
+	follow.Type = socket.PublishKey
+	follow.Topic = "room"
+	follow.Data = []byte("follow-payload")
+	select {
+	case tm.centralChan <- follow:
+	case <-time.After(time.Second):
+		t.Fatal("FT-03: follow-up enqueue blocked")
+	}
+	select {
+	case followGot := <-client.sendOut:
+		if string(followGot.Data) != "follow-payload" {
+			t.Fatalf("FT-03: follow-up payload = %q", followGot.Data)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("FT-03: subscriber did not receive the follow-up")
+	}
+	msg.Data = []byte("hijacked-payload")
+	if string(got.Data) != "original-payload" {
+		t.Fatalf("FT-03: queued message changed after it was handed to the bucket: %q", got.Data)
 	}
 }
 
@@ -83,7 +86,7 @@ func TestAudit_FT07_NilIdWorkerDoesNotKillRead(t *testing.T) {
 		ws:        server,
 		closeChan: make(chan struct{}),
 	}
-	IdWorker = nil
+	storeIDWorker(nil)
 	go ft.readLoop()
 	if err := client.WriteMessage(websocket.TextMessage, []byte(`{"topic":"room","type":"subscribe","data":{}}`)); err != nil {
 		t.Fatal(err)
@@ -162,7 +165,7 @@ func TestAudit_FT07_OversizedFrameCloses(t *testing.T) {
 func TestAudit_FT09_SubscribeHasDeadline(t *testing.T) {
 	auditEnv(t)
 	finished := make(chan struct{})
-	topicManageGrpc = &scriptedTopic{
+	storeTopicGrpc(&scriptedTopic{
 		sub: func(ctx context.Context, in *pb.SubscribeTopicRequest) (*pb.SubscribeTopicResponse, error) {
 			select {
 			case <-ctx.Done():
@@ -173,7 +176,7 @@ func TestAudit_FT09_SubscribeHasDeadline(t *testing.T) {
 				return nil, errors.New("subscribe leash expired")
 			}
 		},
-	}
+	})
 	ft := auditTower(t, "c1", "u1")
 	ft.topic = map[string]bool{}
 
@@ -268,18 +271,18 @@ func TestAudit_NW05_ReconnectReplaysSubscriptions(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("NW05: manager did not accept the gateway connection")
 	}
-	topicManage = cli
+	storeTopicManage(cli)
 
 	var mu sync.Mutex
 	var calls []string
-	topicManageGrpc = &scriptedTopic{
+	storeTopicGrpc(&scriptedTopic{
 		sub: func(ctx context.Context, in *pb.SubscribeTopicRequest) (*pb.SubscribeTopicResponse, error) {
 			mu.Lock()
 			calls = append(calls, in.Ip+" "+strings.Join(in.Topic, ","))
 			mu.Unlock()
 			return &pb.SubscribeTopicResponse{}, nil
 		},
-	}
+	})
 	ft := &FireTower{topic: map[string]bool{}, connId: 0}
 	if _, err := ft.bindTopic([]string{"room"}); err != nil {
 		t.Fatalf("initial subscribe: %v", err)
@@ -344,6 +347,113 @@ func TestAudit_LG01_RepeatedCloseClearsSubscriptions(t *testing.T) {
 	}
 }
 
+func TestAudit_ReplayIsOneAtATime(t *testing.T) {
+	auditEnv(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var mu sync.Mutex
+	var begins, ends int
+	storeTopicGrpc(&scriptedTopic{
+		sub: func(_ context.Context, in *pb.SubscribeTopicRequest) (*pb.SubscribeTopicResponse, error) {
+			mu.Lock()
+			if in.RoundBegin {
+				begins++
+			}
+			if in.RoundEnd {
+				ends++
+			}
+			mu.Unlock()
+			if in.RoundBegin {
+				once.Do(func() { close(started) })
+				<-release
+			}
+			return &pb.SubscribeTopicResponse{}, nil
+		},
+	})
+	go replayLocalTopics()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("replay did not call SubscribeTopic")
+	}
+	done := make(chan struct{})
+	go func() {
+		replayLocalTopics()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("a second replay waited on the one already running")
+	}
+	close(release)
+	deadline := time.After(time.Second)
+	for {
+		mu.Lock()
+		ok := begins > 0 && ends > 0
+		mu.Unlock()
+		if ok {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("replay round flags begin=%d end=%d", begins, ends)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestAudit_DrainClosesAndRejects(t *testing.T) {
+	auditEnv(t)
+	t.Cleanup(func() { draining.Store(false) })
+	var towers []*FireTower
+	for i := 0; i < 3; i++ {
+		server, _, cleanup := wsPair(t)
+		t.Cleanup(cleanup)
+		ft := BuildTower(server, "drain-"+itoa(i))
+		if ft == nil {
+			t.Fatal("BuildTower returned nil before drain")
+		}
+		towers = append(towers, ft)
+	}
+	Drain(2, time.Millisecond)
+	for _, ft := range towers {
+		ft.mutex.Lock()
+		closed := ft.isClose
+		ft.mutex.Unlock()
+		if !closed {
+			t.Fatal("drain left a connection open")
+		}
+	}
+	server, _, cleanup := wsPair(t)
+	t.Cleanup(cleanup)
+	if BuildTower(server, "after-drain") != nil {
+		t.Fatal("BuildTower accepted a connection while draining")
+	}
+}
+
+func TestAudit_SubscribeFailHandler(t *testing.T) {
+	auditEnv(t)
+	storeTopicGrpc(&scriptedTopic{
+		sub: func(context.Context, *pb.SubscribeTopicRequest) (*pb.SubscribeTopicResponse, error) {
+			return nil, errors.New("manager down")
+		},
+	})
+	ft := auditTower(t, "sf", "user")
+	ft.topic = map[string]bool{}
+	var called bool
+	ft.SetSubscribeFailHandler(func(topics []string, err error) {
+		called = err != nil && len(topics) == 1
+	})
+	if _, err := ft.bindTopic([]string{"sf-room"}); err == nil {
+		t.Fatal("subscribe succeeded while manager was down")
+	}
+	if !called {
+		t.Fatal("subscribe failure handler was not called")
+	}
+}
+
 func TestAudit_FT11_StressPackageBuilds(t *testing.T) {
 	root := filepath.Clean(filepath.Join("..", ".."))
 	out := filepath.Join(t.TempDir(), "stress.test.exe")
@@ -358,7 +468,7 @@ func TestAudit_FT11_StressPackageBuilds(t *testing.T) {
 
 func TestAudit_NilPathsDoNotPanic(t *testing.T) {
 	saveAuditGlobals(t)
-	IdWorker = nil
+	storeIDWorker(nil)
 	defer func() {
 		if recover() != nil {
 			t.Fatal("nil path panicked")

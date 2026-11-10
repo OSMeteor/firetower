@@ -16,50 +16,56 @@ import (
 )
 
 func TestAudit_FT03_FullBucketDoesNotBlockOthers(t *testing.T) {
-	oldConfig := ConfigTree
-	// 最后执行：中心循环读的是全局 TM，收尾时停在一条空通道上。
+	prev := hotTopicMin.Load()
+	hotTopicMin.Store(0)
+	t.Cleanup(func() { hotTopicMin.Store(prev) })
+
+	wedged := &Bucket{BuffChan: make(chan *socket.SendMessage, 1)}
+	open := &Bucket{BuffChan: make(chan *socket.SendMessage, 4)}
+	wedged.BuffChan <- &socket.SendMessage{Topic: "hot-room"}
+	hotClient := &FireTower{ClientId: "hot", sendOut: make(chan *socket.SendMessage, 1)}
+	openClient := &FireTower{ClientId: "open", sendOut: make(chan *socket.SendMessage, 1)}
+	wedged.AddSubscribe("hot-room", hotClient)
+	open.AddSubscribe("open-room", openClient)
 	t.Cleanup(func() {
-		TM = &TowerManager{
-			bucket: []*Bucket{
-				{BuffChan: make(chan *socket.SendMessage, 8)},
-				{BuffChan: make(chan *socket.SendMessage, 8)},
-			},
-			centralChan: make(chan *socket.SendMessage),
-		}
-		ConfigTree = oldConfig
+		wedged.DelSubscribe("hot-room", hotClient)
+		open.DelSubscribe("open-room", openClient)
 	})
-	loadAuditConfig(t, 3600, 1, 1, 2)
-	buildBuckets()
-	if len(TM.bucket) < 2 {
-		t.Fatal("FT-03: expected 2 buckets")
-	}
 
-	client := newMockTower("c-open", 8)
-	TM.bucket[1].AddSubscribe("room", client)
-	TM.bucket[0].mu.Lock()
-	t.Cleanup(func() { TM.bucket[0].mu.Unlock() })
+	storeTM(&TowerManager{
+		bucket:      []*Bucket{wedged, open},
+		centralChan: make(chan *socket.SendMessage, 16),
+	})
+	go TM.dispatch(2)
 
-	for i := 0; i < 3; i++ {
+	before := bucketDrops.Load()
+	start := time.Now()
+	for i := 0; i < 5; i++ {
 		msg := socket.GetSendMessage("ft03", "audit")
 		msg.Type = socket.PublishKey
-		msg.Topic = "room"
+		msg.Topic = "hot-room"
 		msg.Data = []byte{byte('a' + i)}
-		select {
-		case TM.centralChan <- msg:
-		case <-time.After(time.Second):
-			t.Fatalf("FT-03: central enqueue %d blocked", i)
-		}
+		TM.centralChan <- msg
 	}
+	openMsg := socket.GetSendMessage("ft03", "audit")
+	openMsg.Type = socket.PublishKey
+	openMsg.Topic = "open-room"
+	openMsg.Data = []byte("open")
+	TM.centralChan <- openMsg
 
-	deadline := time.After(500 * time.Millisecond)
-	got := 0
-	for got < 3 {
-		select {
-		case <-client.sendOut:
-			got++
-		case <-deadline:
-			t.Fatalf("FT-03: open bucket received %d/3 messages while another bucket was wedged", got)
+	select {
+	case got := <-open.BuffChan:
+		if string(got.Data) != "open" {
+			t.Fatalf("open topic got %q", got.Data)
 		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("FT-03: a full bucket held up another topic")
+	}
+	if elapsed := time.Since(start); elapsed >= 150*time.Millisecond {
+		t.Fatalf("FT-03: dispatch waited %s on a full bucket", elapsed)
+	}
+	if bucketDrops.Load()-before < 5 {
+		t.Fatalf("FT-03: full bucket drops=%d", bucketDrops.Load()-before)
 	}
 }
 
@@ -134,9 +140,9 @@ func TestAudit_FT08_ToSelfIsQueued(t *testing.T) {
 	if err := ft.ToSelf([]byte("queued-body")); err != nil {
 		t.Fatalf("ToSelf: %v", err)
 	}
-	_ = client.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
-	if _, data, err := client.ReadMessage(); err == nil {
-		t.Fatalf("FT-08: ToSelf wrote the socket directly, got %q", data)
+	time.Sleep(200 * time.Millisecond)
+	if len(ft.sendOut) != 1 {
+		t.Fatal("FT-08: ToSelf wrote the socket directly instead of leaving the payload queued")
 	}
 
 	go ft.sendLoop()
@@ -144,6 +150,31 @@ func TestAudit_FT08_ToSelfIsQueued(t *testing.T) {
 	_, data, err := client.ReadMessage()
 	if err != nil || string(data) != "queued-body" {
 		t.Fatalf("FT-08: queued payload was not delivered by the single writer: %v %q", err, data)
+	}
+}
+
+func TestAudit_CO06_SendLoopLeavesMessageType(t *testing.T) {
+	saveAuditGlobals(t)
+	loadAuditConfig(t, 3600, 4, 1, 1)
+	noopAuditLogs()
+	server, client, cleanup := wsPair(t)
+	defer cleanup()
+	ft := &FireTower{
+		sendOut:   make(chan *socket.SendMessage, 2),
+		ws:        server,
+		closeChan: make(chan struct{}),
+	}
+	msg := &socket.SendMessage{Type: "publish", Topic: "room", Data: []byte("body")}
+	ft.sendOut <- msg
+	go ft.sendLoop()
+	t.Cleanup(func() { ft.Close() })
+	_ = client.SetReadDeadline(time.Now().Add(time.Second))
+	_, data, err := client.ReadMessage()
+	if err != nil || string(data) != "body" {
+		t.Fatalf("CO06: payload = %q, err = %v", data, err)
+	}
+	if msg.MessageType != 0 {
+		t.Fatalf("CO06: sendLoop wrote MessageType=%d on the shared message", msg.MessageType)
 	}
 }
 

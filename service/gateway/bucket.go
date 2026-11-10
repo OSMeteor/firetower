@@ -28,24 +28,34 @@ type Bucket struct {
 	len            int64
 	topicRelevance map[string]map[string]*FireTower // topic -> websocket clientid -> websocket conn
 	BuffChan       chan *socket.SendMessage         // bucket的消息处理队列
+	hot            map[string]chan *socket.SendMessage
 }
 
+// hotTopicMin 大于 0 时，本桶订阅者达到这个数的 Topic 走自己的队列，不再占用共用的 BuffChan。0 表示关闭。
+var hotTopicMin atomic.Int64
+
+var (
+	holderMu sync.Mutex
+	holders  = map[string]map[*Bucket]struct{}{}
+)
+
 func buildBuckets() {
-	if ConfigTree == nil {
+	if loadConfigTree() == nil {
 		fmt.Println("config is nil, skip buckets")
 		return
 	}
 	bucketNum := configInt("bucket.Num", 1)
 	central := configInt("bucket.CentralChanCount", 1024)
-	TM = &TowerManager{
+	tm := &TowerManager{
 		bucket:      make([]*Bucket, bucketNum),
 		centralChan: make(chan *socket.SendMessage, central),
 	}
+	storeTM(tm)
 
 	for i := 0; i < bucketNum; i++ {
-		TM.bucket[i] = newBucket()
+		tm.bucket[i] = newBucket()
 	}
-	go TM.dispatch(bucketNum)
+	go tm.dispatch(bucketNum)
 }
 
 func (t *TowerManager) dispatch(bucketNum int) {
@@ -63,20 +73,59 @@ func (t *TowerManager) dispatch(bucketNum int) {
 		if message == nil {
 			continue
 		}
-		for i := 0; i < bucketNum && i < len(t.bucket); i++ {
-			b := t.bucket[i]
-			if b == nil || b.BuffChan == nil {
+		if cap(t.centralChan) > 0 {
+			line := int64(cap(t.centralChan) * configInt("warn.queuePercent", 70) / 100)
+			warnCapacity("centralChan", int64(len(t.centralChan)), line, "check one topic before growing the queue")
+		}
+		targets := bucketsFor(message.Topic)
+		if message.Type == socket.OfflineUserKey {
+			targets = t.bucket
+		}
+		// 采样日志在入队之前打。入队之后测试会改写原消息，用来确认订阅者拿到的是副本。
+		if socket.NoteHot() {
+			message.Info("Sended")
+		}
+		for _, b := range targets {
+			if b == nil {
 				continue
 			}
-			select {
-			case b.BuffChan <- message:
-			default:
-				fmt.Printf("bucket %d full, drop message\n", i)
-			}
+			b.enqueue(cloneSendMessage(message))
 		}
-		message.Info("Sended")
 		message.Recycling()
 	}
+}
+
+func deliverOrDrop(b *Bucket, index int, message *socket.SendMessage) {
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Printf("PANIC: bucket deliver recovered: %v\n", err)
+		}
+	}()
+	if b == nil || b.BuffChan == nil || message == nil {
+		return
+	}
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case b.BuffChan <- message:
+	case <-timer.C:
+		noteBucketDrop(index)
+	}
+}
+
+var (
+	bucketDrops       atomic.Int64
+	lastBucketDropLog atomic.Int64
+)
+
+func noteBucketDrop(index int) {
+	bucketDrops.Add(1)
+	now := time.Now().UnixNano()
+	prev := lastBucketDropLog.Load()
+	if now-prev < int64(time.Second) || !lastBucketDropLog.CompareAndSwap(prev, now) {
+		return
+	}
+	fmt.Printf("bucket %d full, drop message\n", index)
 }
 
 func newBucket() *Bucket {
@@ -104,13 +153,11 @@ var (
 )
 
 func getNewBucketId() int64 {
-	atomic.AddInt64(&bucketId, 1)
-	return bucketId
+	return atomic.AddInt64(&bucketId, 1)
 }
 
 func getConnId() uint64 {
-	atomic.AddUint64(&connId, 1)
-	return connId
+	return atomic.AddUint64(&connId, 1)
 }
 
 // GetBucket 获取一个可以分配当前连接的bucket
@@ -139,7 +186,8 @@ func (b *Bucket) consumer() {
 				continue
 			}
 			switch message.Type {
-			case socket.PublishKey:
+			case socket.PublishKey, socket.StateKey:
+				callBeforePush(message)
 				b.push(message)
 			case socket.OfflineTopicByUserIdKey:
 				// 需要退订的topic和user_id
@@ -172,6 +220,7 @@ func (b *Bucket) AddSubscribe(topic string, bt *FireTower) {
 		b.topicRelevance[topic] = make(map[string]*FireTower)
 		b.topicRelevance[topic][bt.ClientId] = bt
 	}
+	noteHolder(topic, b, true)
 	b.mu.Unlock()
 }
 
@@ -181,15 +230,16 @@ func (b *Bucket) DelSubscribe(topic string, bt *FireTower) {
 		return
 	}
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	if m, ok := b.topicRelevance[topic]; ok {
 		if cur, exists := m[bt.ClientId]; exists && cur == bt {
 			delete(m, bt.ClientId)
 		}
 		if len(m) == 0 {
 			delete(b.topicRelevance, topic)
+			noteHolder(topic, b, false)
 		}
 	}
-	b.mu.Unlock()
 }
 
 // Push 桶内进行遍历push
@@ -210,13 +260,35 @@ func (b *Bucket) push(message *socket.SendMessage) error {
 		}
 	}
 	b.mu.RUnlock()
+	if message.Type == socket.StateKey {
+		kept := targets[:0]
+		for _, v := range targets {
+			if !v.passiveTopic(message.Topic) {
+				kept = append(kept, v)
+			}
+		}
+		targets = kept
+	}
 	if len(targets) == 0 {
 		return ErrorTopicEmpty
 	}
 	for _, v := range targets {
-		_ = v.Send(message)
+		deliverTo(v, message)
 	}
 	return nil
+}
+
+// deliverTo 把一条消息交给一个连接。一个连接 panic 只丢掉它这一份，桶里的其他连接继续收。
+func deliverTo(v *FireTower, message *socket.SendMessage) {
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Printf("PANIC: deliver recovered: %v\n", err)
+		}
+	}()
+	if v == nil {
+		return
+	}
+	_ = v.Send(message)
 }
 
 // UnSubscribeByUserId 服务端指定某个用户退订某个topic
@@ -241,9 +313,12 @@ func (b *Bucket) unSubscribeByUserId(message *socket.SendMessage) error {
 	}
 	_, err := target.unbindTopic([]string{message.Topic})
 	_ = target.ToSelf([]byte("{}"))
-	if target.unSubscribeHandler != nil {
-		target.unSubscribeHandler(nil, []string{message.Topic})
-	}
+	handler := target.unSubscribeHandler
+	safeCall("unsubscribe handler", func() {
+		if handler != nil {
+			handler(nil, []string{parentTopic(message.Topic)})
+		}
+	})
 	return err
 }
 
@@ -270,9 +345,13 @@ func (b *Bucket) unSubscribeAll(message *socket.SendMessage) error {
 		if _, err := v.unbindTopic([]string{message.Topic}); err != nil && first == nil {
 			first = err
 		}
-		if v.onSystemRemove != nil {
-			v.onSystemRemove(message.Topic)
-		}
+		handler := v.onSystemRemove
+		topic := parentTopic(message.Topic)
+		safeCall("system remove", func() {
+			if handler != nil {
+				handler(topic)
+			}
+		})
 	}
 	if first != nil {
 		return first
@@ -299,7 +378,135 @@ func (b *Bucket) offlineUsers(message *socket.SendMessage) error {
 		return ErrorTopicEmpty
 	}
 	for _, v := range targets {
-		v.Close()
+		user := v
+		safeCall("offline user", func() { user.Close() })
 	}
 	return nil
+}
+
+func (b *Bucket) enqueue(message *socket.SendMessage) {
+	if b == nil || message == nil {
+		return
+	}
+	if ch := b.hotChan(message); ch != nil {
+		select {
+		case ch <- message:
+		default:
+			noteBucketDrop(int(b.id))
+		}
+		return
+	}
+	if b.BuffChan == nil {
+		return
+	}
+	select {
+	case b.BuffChan <- message:
+	default:
+		// 不等待。dispatch 只有一个协程，在这里等会让别的 Topic 一起排在 centralChan 后面被丢掉。
+		noteBucketDrop(int(b.id))
+	}
+}
+
+func (b *Bucket) hotChan(message *socket.SendMessage) chan *socket.SendMessage {
+	limit := int(hotTopicMin.Load())
+	if limit <= 0 || message == nil || message.Topic == "" || message.Type == socket.OfflineUserKey {
+		return nil
+	}
+	b.mu.Lock()
+	ch := b.hot[message.Topic]
+	var start chan *socket.SendMessage
+	if ch == nil {
+		n := 0
+		if m := b.topicRelevance[message.Topic]; m != nil {
+			n = len(m)
+		}
+		if n >= limit {
+			ch = make(chan *socket.SendMessage, 8)
+			if b.hot == nil {
+				b.hot = map[string]chan *socket.SendMessage{}
+			}
+			b.hot[message.Topic] = ch
+			start = ch
+		}
+	}
+	b.mu.Unlock()
+	if start != nil {
+		go b.hotLoop(start)
+	}
+	return ch
+}
+
+// testBeforePush 只给测试注入一次 panic。正式运行保持 nil。
+type pushFn func(*socket.SendMessage)
+
+var testBeforePush atomic.Pointer[pushFn]
+
+func callBeforePush(message *socket.SendMessage) {
+	if fn := testBeforePush.Load(); fn != nil {
+		(*fn)(message)
+	}
+}
+
+func (b *Bucket) hotLoop(ch chan *socket.SendMessage) {
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Printf("PANIC: hot topic recovered: %v\n", err)
+			time.Sleep(100 * time.Millisecond)
+			go b.hotLoop(ch)
+		}
+	}()
+	for message := range ch {
+		if message == nil {
+			continue
+		}
+		callBeforePush(message)
+		_ = b.push(message)
+	}
+}
+
+func safeCall(name string, fn func()) {
+	if fn == nil {
+		return
+	}
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Printf("PANIC: %s recovered: %v\n", name, err)
+		}
+	}()
+	fn()
+}
+
+func noteHolder(topic string, b *Bucket, add bool) {
+	if topic == "" || b == nil {
+		return
+	}
+	holderMu.Lock()
+	defer holderMu.Unlock()
+	set := holders[topic]
+	if add {
+		if set == nil {
+			set = map[*Bucket]struct{}{}
+			holders[topic] = set
+		}
+		set[b] = struct{}{}
+		return
+	}
+	if set == nil {
+		return
+	}
+	delete(set, b)
+	if len(set) == 0 {
+		delete(holders, topic)
+	}
+}
+
+func bucketsFor(topic string) []*Bucket {
+	holderMu.Lock()
+	defer holderMu.Unlock()
+	set := holders[topic]
+	out := make([]*Bucket, 0, len(set))
+	for b := range set {
+		out = append(out, b)
+	}
+	return out
 }

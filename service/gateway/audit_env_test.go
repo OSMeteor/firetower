@@ -21,17 +21,11 @@ import (
 
 func saveAuditGlobals(t *testing.T) {
 	t.Helper()
-	tm, grpcClient, manage := TM, topicManageGrpc, topicManage
-	logger, fireLogger, worker := TowerLogger, FireLogger, IdWorker
-	cfg := ConfigTree
+	saved := snapshotGW()
+	groups := groupsSnapshot()
 	t.Cleanup(func() {
-		TM = tm
-		topicManageGrpc = grpcClient
-		topicManage = manage
-		TowerLogger = logger
-		FireLogger = fireLogger
-		IdWorker = worker
-		ConfigTree = cfg
+		restoreGW(saved)
+		restoreGroups(groups)
 	})
 }
 
@@ -54,7 +48,7 @@ ConsumerNum = ` + itoa(consumers) + `
 	if err != nil {
 		t.Fatalf("load audit config: %v", err)
 	}
-	ConfigTree = tree
+	storeConfigTree(tree)
 }
 
 func itoa(n int) string {
@@ -72,20 +66,20 @@ func itoa(n int) string {
 }
 
 func noopAuditLogs() {
-	TowerLogger = func(*FireTower, string, string) {}
-	FireLogger = func(*FireInfo, string, string) {}
+	storeTowerLogger(func(*FireTower, string, string) {})
+	storeFireLogger(func(*FireInfo, string, string) {})
 }
 
 func ensureIDWorker(t *testing.T) {
 	t.Helper()
-	if IdWorker != nil {
+	if loadIDWorker() != nil {
 		return
 	}
 	worker, err := snowFlakeByGo.NewWorker(1)
 	if err != nil {
 		t.Fatalf("snowflake worker: %v", err)
 	}
-	IdWorker = worker
+	storeIDWorker(worker)
 }
 
 func installAuditPipe(t *testing.T) {
@@ -95,7 +89,7 @@ func installAuditPipe(t *testing.T) {
 		_ = left.Close()
 		_ = right.Close()
 	})
-	topicManage = &socket.TcpClient{Conn: left}
+	storeTopicManage(&socket.TcpClient{Conn: left})
 }
 
 func installAuditBucket(t *testing.T) *Bucket {
@@ -104,7 +98,7 @@ func installAuditBucket(t *testing.T) *Bucket {
 		topicRelevance: make(map[string]map[string]*FireTower),
 		BuffChan:       make(chan *socket.SendMessage, 4),
 	}
-	TM = &TowerManager{bucket: []*Bucket{bucket}}
+	storeTM(&TowerManager{bucket: []*Bucket{bucket}})
 	return bucket
 }
 
@@ -116,7 +110,7 @@ func auditEnv(t *testing.T) *Bucket {
 	noopAuditLogs()
 	ensureIDWorker(t)
 	installAuditPipe(t)
-	topicManageGrpc = &scriptedTopic{}
+	storeTopicGrpc(&scriptedTopic{})
 	return installAuditBucket(t)
 }
 
@@ -185,9 +179,14 @@ func auditTower(t *testing.T, clientID, userID string) *FireTower {
 type scriptedTopic struct {
 	unsub func(ctx context.Context, in *pb.UnSubscribeTopicRequest) (*pb.UnSubscribeTopicResponse, error)
 	sub   func(ctx context.Context, in *pb.SubscribeTopicRequest) (*pb.SubscribeTopicResponse, error)
+	check func(ctx context.Context, in *pb.CheckTopicExistRequest) (*pb.CheckTopicExistResponse, error)
+	num   func(ctx context.Context, in *pb.GetConnectNumRequest) (*pb.GetConnectNumResponse, error)
 }
 
 func (s *scriptedTopic) GetConnectNum(ctx context.Context, in *pb.GetConnectNumRequest, opts ...grpc.CallOption) (*pb.GetConnectNumResponse, error) {
+	if s != nil && s.num != nil {
+		return s.num(ctx, in)
+	}
 	return &pb.GetConnectNumResponse{}, nil
 }
 
@@ -210,5 +209,8 @@ func (s *scriptedTopic) Publish(ctx context.Context, in *pb.PublishRequest, opts
 }
 
 func (s *scriptedTopic) CheckTopicExist(ctx context.Context, in *pb.CheckTopicExistRequest, opts ...grpc.CallOption) (*pb.CheckTopicExistResponse, error) {
+	if s != nil && s.check != nil {
+		return s.check(ctx, in)
+	}
 	return &pb.CheckTopicExistResponse{}, nil
 }

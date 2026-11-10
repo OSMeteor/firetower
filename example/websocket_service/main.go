@@ -3,9 +3,10 @@ package main
 import (
 	"fmt"
 	"net/http"
-	_ "net/http/pprof"
 	"os"
+	"runtime/pprof"
 	"strconv"
+	"time"
 
 	"github.com/OSMeteor/firetower/service/gateway"
 
@@ -37,6 +38,15 @@ func main() {
 	gateway.ClusterId = 1
 	gateway.Init()
 	http.HandleFunc("/ws", Websocket)
+	if os.Getenv("FIRETOWER_PPROF") == "1" {
+		http.HandleFunc("/debug/pprof/goroutine", func(w http.ResponseWriter, r *http.Request) {
+			debug := 1
+			if r.URL.Query().Get("debug") == "2" {
+				debug = 2
+			}
+			_ = pprof.Lookup("goroutine").WriteTo(w, debug)
+		})
+	}
 	addr := os.Getenv("FIRETOWER_HTTP")
 	if addr == "" {
 		addr = "0.0.0.0:9999"
@@ -50,10 +60,21 @@ func Websocket(w http.ResponseWriter, r *http.Request) {
 	// 做用户身份验证
 
 	// 验证成功才升级连接
-	ws, _ := upgrader.Upgrade(w, r, nil)
-
-	id := GlobalIdWorker.GetId()
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil || ws == nil {
+		return
+	}
+	var id int64
+	if GlobalIdWorker != nil {
+		id = GlobalIdWorker.GetId()
+	} else {
+		id = time.Now().UnixNano()
+	}
 	tower := gateway.BuildTower(ws, strconv.FormatInt(id, 10))
+	if tower == nil {
+		_ = ws.Close()
+		return
+	}
 
 	tower.SetReadHandler(func(fire *gateway.FireInfo) bool {
 		// 做发送验证
