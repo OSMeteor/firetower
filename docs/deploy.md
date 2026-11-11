@@ -1,4 +1,4 @@
-# Firetower 部署手册（v0.6.x，给运维）
+# Firetower 部署手册（给运维）
 
 本文只写怎么部署、怎么检查、出了告警怎么办。为什么这样设计见 [scale-plan.md](scale-plan.md)，消息怎么流转见 [architecture.md](architecture.md)。
 
@@ -26,7 +26,7 @@
 
 - 两个进程之间只走内网。`6666`、`6667` 没有认证，防火墙只放行 Gateway 所在的机器。
 - 不依赖 Redis、Kafka、Etcd。
-- Manager 和全部 Gateway 用同一个 v0.6.x 版本，不能和 v0.5.x 混跑。
+- Manager 和全部 Gateway 用同一个版本。
 - 接入进程（Gateway）的 go.mod 里 `google.golang.org/grpc` 要 v1.25 及以上。
 
 ### 0.2 配置文件只留一份
@@ -279,7 +279,7 @@ Manager 的 `topicmanage.toml` 和场景 A 一样。
 
 ### 配置文件
 
-每台 Gateway 的 `fireTower.toml`：**删掉** `topicServiceAddr` 和 `[grpc] address`，改用 `[[manager]]` 列出全部 Manager（写了 `[[manager]]` 时旧的两项不生效）：
+每台 Gateway 的 `fireTower.toml`：**删掉** `topicServiceAddr` 和 `[grpc] address`，改用 `[[manager]]` 列出全部 Manager（写了 `[[manager]]` 时这两项不生效）：
 
 ```toml
 [[manager]]
@@ -402,24 +402,6 @@ shards = 8
 - 这台机器上的用户会断开，客户端重连后被分到其他 Gateway。
 - 一台一台滚动，不要同时重启多台。
 - 可选：接入进程收到停止信号时调用 `gateway.Drain(批大小, 间隔)`，先拒绝新连接，再分批断开已有连接，避免全部用户同一秒重连。这需要接入进程的代码配合。
-
-### 从 v0.5.x 升级到 v0.6.x
-
-不支持新旧版本混跑。安排一个窗口，Manager 和所有 Gateway 一起换成新版本。
-
-升级前准备好回退用的东西：v0.5.x 的 Manager 程序、v0.5.x 编译的接入进程、升级前的 `fireTower.toml` 和 `topicmanage.toml`。
-
-### 回退到 v0.5.x
-
-也必须整体回退，不能只退一部分：
-
-1. 停掉所有 Gateway（用户会断开）。
-2. 停掉所有 Manager。
-3. 换回 v0.5.x 的 Manager 程序和配置，启动。v0.5.x 只支持一台 Manager，多 Manager 的部署要先改回一台。
-4. 换回 v0.5.x 编译的接入进程和升级前的配置，逐台启动 Gateway。v0.5.x 不认 `[[manager]]`、`[[group]]`、`[memory]`，配置里要改回 `topicServiceAddr` 和 `[grpc] address`。
-5. 按场景 A 或 B 的检查项检查一遍。
-
-回退后内存保护、订阅自动补回等 v0.6 的能力都没有了，Manager 重启后客户端要重连才能恢复收消息。
 
 ---
 
