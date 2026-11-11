@@ -51,3 +51,8 @@ vendor/
 *.exe
 
 
+# Go build and test outputs
+/bin/
+*.test
+*.out
+*.prof

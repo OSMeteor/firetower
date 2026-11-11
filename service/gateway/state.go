@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"fmt"
 	"sync"
 
 	pb "github.com/OSMeteor/firetower/grpc/manager"
@@ -122,8 +123,14 @@ func storeTowerLogger(fn func(*FireTower, string, string)) {
 	gwMu.Unlock()
 }
 
+// 日志函数可以被业务替换。它在各协程的 recover 里也会被调用，自己 panic 时不能再往外抛。
 func callTowerLogger(t *FireTower, kind, info string) {
 	if fn := loadTowerLogger(); fn != nil {
+		defer func() {
+			if err := recover(); err != nil {
+				fmt.Printf("PANIC: tower logger recovered: %v\n", err)
+			}
+		}()
 		fn(t, kind, info)
 	}
 }
@@ -142,6 +149,11 @@ func storeFireLogger(fn func(*FireInfo, string, string)) {
 
 func callFireLogger(f *FireInfo, kind, info string) {
 	if fn := loadFireLogger(); fn != nil {
+		defer func() {
+			if err := recover(); err != nil {
+				fmt.Printf("PANIC: fire logger recovered: %v\n", err)
+			}
+		}()
 		fn(f, kind, info)
 	}
 }

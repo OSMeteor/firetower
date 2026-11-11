@@ -329,11 +329,18 @@ func runCrash(topicBin, gwBin string) error {
 	if err := stillUp(s.topic, s.topic.Process.Pid); err != nil {
 		return fmt.Errorf("坏帧之后 TopicManager 不在了: %w\n%s", err, tail(s.tmLog))
 	}
-	if err := publishTo(s.http, "crash-room", "crash-ok"); err != nil {
-		return err
+	// publishTo 发完就断开，这一帧可能在 Gateway 读到之前就随连接一起丢了（最多一次）。多发几次再下结论。
+	var seen error
+	for try := 0; try < 5; try++ {
+		if err := publishTo(s.http, "crash-room", "crash-ok"); err != nil {
+			return err
+		}
+		if seen = good.waitContains("crash-ok", 2*time.Second); seen == nil {
+			break
+		}
 	}
-	if err := good.waitContains("crash-ok", 5*time.Second); err != nil {
-		return fmt.Errorf("坏帧之后正常连接收不到消息: %w\n%s", err, tail(s.gwLog))
+	if seen != nil {
+		return fmt.Errorf("坏帧之后正常连接收不到消息: %w\n%s", seen, tail(s.gwLog))
 	}
 	fmt.Println("CRASH 坏帧之后进程还在，正常连接仍能收消息")
 

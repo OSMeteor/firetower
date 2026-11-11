@@ -64,7 +64,7 @@ func (s *SendMessage) Panic(info string) {
 		return
 	}
 	if SendLogger != nil {
-		SendLogger(s, "Panic", info)
+		callSendLogger(s, "Panic", info)
 	}
 	s.Recycling()
 }
@@ -74,7 +74,7 @@ func (s *SendMessage) Info(info string) {
 	if s == nil || SendLogger == nil {
 		return
 	}
-	SendLogger(s, "INFO", info)
+	callSendLogger(s, "INFO", info)
 }
 
 // Error 记录一个ERROR级别的日志
@@ -82,7 +82,21 @@ func (s *SendMessage) Error(info string) {
 	if s == nil || SendLogger == nil {
 		return
 	}
-	SendLogger(s, "ERROR", info)
+	callSendLogger(s, "ERROR", info)
+}
+
+// SendLogger 可以被业务替换，各协程的 recover 里也会走到这里。它自己 panic 时不能再往外抛。
+func callSendLogger(s *SendMessage, types, info string) {
+	fn := SendLogger
+	if fn == nil {
+		return
+	}
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Printf("PANIC: send logger recovered: %v\n", err)
+		}
+	}()
+	fn(s, types, info)
 }
 
 func sendLog(s *SendMessage, types, info string) {

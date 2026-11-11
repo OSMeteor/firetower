@@ -12,6 +12,8 @@ import (
 	pb "github.com/OSMeteor/firetower/grpc/manager"
 	"github.com/OSMeteor/firetower/socket"
 	"github.com/pelletier/go-toml"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // managerLink 是连接池里的一台 Manager。register 为真才接收订阅，publish 为真才接收发布。
@@ -223,16 +225,52 @@ func subscribeAll(topics []string, counts []int64, versions []uint64) error {
 		if err != nil {
 			return err
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), managerRPCTimeout)
-		_, err = l.rpc.SubscribeTopic(ctx, &pb.SubscribeTopicRequest{
-			Topic: topics, Ip: ip, Count: counts, Version: versions,
+		req := &pb.SubscribeTopicRequest{Topic: topics, Ip: ip, Count: counts, Version: versions}
+		err = callRegister(l, func(ctx context.Context) error {
+			_, err := l.rpc.SubscribeTopic(ctx, req)
+			return err
 		})
-		cancel()
 		if err != nil {
+			// Manager 连着、只是一直答不上来（登记排队、gRPC 在重连）：订阅已经记进本机的整表，
+			// 交给后台重放补登记，重试到它收下为止。不能因为 Manager 慢就把这次订阅丢掉。
+			// Manager 明确拒绝、或者这台已经断开时，仍然整次失败。
+			if retryableRegister(err) && l.connected() {
+				replayLinkSoon(l)
+				continue
+			}
 			return err
 		}
 	}
 	return nil
+}
+
+// 登记请求带绝对人数和版本号，重发是幂等的。Manager 只是一时忙（登记在排队）或者 gRPC 正在重连时，
+// 超时不代表失败，按递增的超时再发；还不行就交给后台重放（见 subscribeAll）。
+// Manager 明确返回错误、或者这台的 TCP 已经断开时不重试，照旧整次失败。
+var registerTimeouts = []time.Duration{managerRPCTimeout, 2 * managerRPCTimeout, 4 * managerRPCTimeout}
+
+func callRegister(l *managerLink, call func(ctx context.Context) error) error {
+	var err error
+	for i, d := range registerTimeouts {
+		ctx, cancel := context.WithTimeout(context.Background(), d)
+		err = call(ctx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		if i == len(registerTimeouts)-1 || !retryableRegister(err) || !l.connected() {
+			return err
+		}
+	}
+	return err
+}
+
+func retryableRegister(err error) bool {
+	switch status.Code(err) {
+	case codes.DeadlineExceeded, codes.Unavailable:
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded)
 }
 
 func unsubscribeAll(topics []string, counts []int64, versions []uint64) error {
@@ -254,6 +292,11 @@ func unsubscribeAll(topics []string, counts []int64, versions []uint64) error {
 			Topic: topics, Ip: ip, Count: counts, Version: versions,
 		})
 		cancel()
+		if err != nil {
+			// 退订在 Close 里调用，不在这里重试，免得关连接变慢。Manager 上的人数先多着，
+			// 后台马上整表重放一次把它盖回去，不用等 3 分钟的对账。
+			replayLinkSoon(l)
+		}
 		if err != nil && failed == nil {
 			failed = err
 		}

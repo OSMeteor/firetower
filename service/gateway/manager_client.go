@@ -8,6 +8,7 @@ import (
 	"github.com/OSMeteor/firetower/socket"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 )
 
 // buildManagerClient 实例化一个与topicManager连接的tcp链接
@@ -58,7 +59,17 @@ func connectSpec(spec managerSpec) {
 	sleepTime := time.Second
 	var rpc pb.TopicServiceClient
 	for rpc == nil {
-		conn, err := grpc.Dial(spec.grpc, grpc.WithInsecure())
+		// gRPC 默认的重连退避最长 120 秒。Manager 停得久一点再回来时，TCP 几秒内就连上了，
+		// 订阅和重放却要等 gRPC 的退避走完。这里把上限压到 3 秒。
+		conn, err := grpc.Dial(spec.grpc, grpc.WithInsecure(), grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff: backoff.Config{
+				BaseDelay:  200 * time.Millisecond,
+				Multiplier: 1.6,
+				Jitter:     0.2,
+				MaxDelay:   3 * time.Second,
+			},
+			MinConnectTimeout: 3 * time.Second,
+		}))
 		if err != nil {
 			fmt.Printf("[manager client] grpc connect %s error: %v, retrying in %v\n", spec.name, err, sleepTime)
 			time.Sleep(sleepTime)

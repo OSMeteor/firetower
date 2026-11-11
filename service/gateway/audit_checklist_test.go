@@ -31,11 +31,12 @@ func TestAudit_FT03_QueuedMessageKeepsPayload(t *testing.T) {
 	tm := loadTM()
 
 	client := newMockTower("payload", 4)
-	tm.bucket[0].AddSubscribe("room", client)
+	// 用独有的 Topic 名：holders 是包级的表，前面用例留下的旧 Bucket 也订着 "room"，分发给它们会各等 100ms。
+	tm.bucket[0].AddSubscribe("ft03-room", client)
 
 	msg := socket.GetSendMessage("ft03-own", "audit")
 	msg.Type = socket.PublishKey
-	msg.Topic = "room"
+	msg.Topic = "ft03-room"
 	msg.Data = []byte("original-payload")
 	select {
 	case tm.centralChan <- msg:
@@ -52,7 +53,7 @@ func TestAudit_FT03_QueuedMessageKeepsPayload(t *testing.T) {
 	// 才说明上一条的复制已经结束，这时再改写原消息。
 	follow := socket.GetSendMessage("ft03-follow", "audit")
 	follow.Type = socket.PublishKey
-	follow.Topic = "room"
+	follow.Topic = "ft03-room"
 	follow.Data = []byte("follow-payload")
 	select {
 	case tm.centralChan <- follow:
@@ -165,14 +166,16 @@ func TestAudit_FT07_OversizedFrameCloses(t *testing.T) {
 func TestAudit_FT09_SubscribeHasDeadline(t *testing.T) {
 	auditEnv(t)
 	finished := make(chan struct{})
+	var once sync.Once
+	// 超时的登记会按递增的超时重发几次（见 registerTimeouts），这个替身要允许被调用多次。
 	storeTopicGrpc(&scriptedTopic{
 		sub: func(ctx context.Context, in *pb.SubscribeTopicRequest) (*pb.SubscribeTopicResponse, error) {
 			select {
 			case <-ctx.Done():
-				close(finished)
+				once.Do(func() { close(finished) })
 				return nil, ctx.Err()
 			case <-time.After(5 * time.Second):
-				close(finished)
+				once.Do(func() { close(finished) })
 				return nil, errors.New("subscribe leash expired")
 			}
 		},
@@ -190,14 +193,27 @@ func TestAudit_FT09_SubscribeHasDeadline(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("FT-09: subscribe RPC was not cancelled")
 	}
+	// Manager 连着但一直不回：订阅不能卡住这条连接，也不能被丢掉。
+	// 按递增超时重发后，本机保留订阅、交给后台重放补登记。
 	select {
 	case err := <-returned:
-		if err == nil {
-			t.Fatal("FT-09: bindTopic returned success after the RPC was cancelled")
+		if err != nil {
+			t.Fatalf("FT-09: subscription was dropped because the manager was slow: %v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(registerBudget() + time.Second):
 		t.Fatal("FT-09: bindTopic did not return")
 	}
+	if !ft.topic["room"] {
+		t.Fatal("FT-09: the subscription was not kept locally")
+	}
+}
+
+func registerBudget() time.Duration {
+	var total time.Duration
+	for _, d := range registerTimeouts {
+		total += d
+	}
+	return total
 }
 
 func TestAudit_FT09_SubscribeBeforeManagerReady(t *testing.T) {
@@ -291,7 +307,8 @@ func TestAudit_NW05_ReconnectReplaysSubscriptions(t *testing.T) {
 	_ = first.Close()
 
 	select {
-	case <-accepted:
+	case second := <-accepted:
+		t.Cleanup(func() { _ = second.Close() })
 	case <-time.After(3 * time.Second):
 		t.Fatal("NW05: manager TCP connection was not re-established")
 	}

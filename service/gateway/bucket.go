@@ -77,19 +77,30 @@ func (t *TowerManager) dispatch(bucketNum int) {
 			line := int64(cap(t.centralChan) * configInt("warn.queuePercent", 70) / 100)
 			warnCapacity("centralChan", int64(len(t.centralChan)), line, "check one topic before growing the queue")
 		}
-		targets := bucketsFor(message.Topic)
-		if message.Type == socket.OfflineUserKey {
-			targets = t.bucket
-		}
 		// 采样日志在入队之前打。入队之后测试会改写原消息，用来确认订阅者拿到的是副本。
 		if socket.NoteHot() {
 			message.Info("Sended")
 		}
-		for _, b := range targets {
-			if b == nil {
-				continue
+		// 本机发布的帧已经带着片键。业务后端和管理命令按房间名发来的帧在这里展开成本机的各片。
+		keys := []string{message.Topic}
+		if topicShards(message.Topic) >= 2 {
+			keys = publishKeys(message.Topic)
+		}
+		for _, key := range keys {
+			targets := bucketsFor(key)
+			if message.Type == socket.OfflineUserKey {
+				targets = t.bucket
 			}
-			b.enqueue(cloneSendMessage(message))
+			for _, b := range targets {
+				if b == nil {
+					continue
+				}
+				copied := cloneSendMessage(message)
+				if copied != nil {
+					copied.Topic = key
+				}
+				b.enqueue(copied)
+			}
 		}
 		message.Recycling()
 	}

@@ -162,6 +162,8 @@ type FireTower struct {
 	UserId    string // 一般业务中每个连接都是一个用户 用来给业务提供用户识别
 	Cookie    []byte // 这里提供给业务放一个存放跟当前连接相关的数据信息
 	startTime time.Time
+	// 最后一次收到 Pong 或任何客户端消息的时间（UnixNano）。内存保护靠它判断连接是否还活着。
+	lastActive atomic.Int64
 
 	readIn    chan *FireInfo           // 读取队列
 	sendOut   chan *socket.SendMessage // 发送队列
@@ -206,6 +208,7 @@ func Init() {
 	loadGroups(loadConfigTree())
 	buildBuckets()       // 构建服务架构
 	buildManagerClient() // 构建连接manager(topic管理服务)的客户端
+	startMemoryGuard()   // 配置了 memory.limitMB 才会启动
 }
 
 // BuildTower 实例化一个websocket客户端
@@ -221,6 +224,10 @@ func BuildTower(ws *websocket.Conn, clientId string) (tower *FireTower) {
 
 	if ws == nil {
 		towerLog(nil, "ERROR", "websocket.Conn is nil")
+		return nil
+	}
+	if memRejecting.Load() {
+		noteMemReject()
 		return nil
 	}
 	if !reserveConn() {
@@ -291,6 +298,7 @@ func buildNewTower(ws *websocket.Conn, clientId string) *FireTower {
 	t.connId = getConnId()
 	t.ClientId = clientId
 	t.startTime = time.Now()
+	t.touch()
 	t.readIn = make(chan *FireInfo, configInt("chanLens", 8))
 	t.sendOut = make(chan *socket.SendMessage, configInt("chanLens", 8))
 	t.topic = make(map[string]bool)
@@ -320,7 +328,9 @@ func (t *FireTower) Run() {
 	go t.readDispose()
 
 	if t.onConnectHandler != nil {
-		ok := t.onConnectHandler()
+		// 回调跑在调用方的协程上。它 panic 时按拒绝连接处理，不能带走进程。
+		ok := false
+		safeCall("on connect handler", func() { ok = t.onConnectHandler() })
 		if !ok {
 			t.Close()
 		}
@@ -374,7 +384,7 @@ func (t *FireTower) bindTopic(topic []string) ([]string, error) {
 	seen := make(map[string]struct{}, len(topic))
 	var pending []string
 	for _, v := range topic {
-		if v == "" {
+		if v == "" || reservedTopic(v) {
 			continue
 		}
 		if _, ok := t.topic[v]; ok {
@@ -403,7 +413,9 @@ func (t *FireTower) bindTopic(topic []string) ([]string, error) {
 	}
 	counts, versions := noteSubscribe(routes)
 	if err := subscribeAll(routes, counts, versions); err != nil {
-		revertSubscribe(routes)
+		// 多台 Manager 时可能前几台已经写成功。把撤销后的人数盖回去，写不到的那台等重放。
+		backCounts, backVersions := revertSubscribe(routes)
+		_ = unsubscribeAll(routes, backCounts, backVersions)
 		if t.subscribeFailHandler != nil {
 			t.subscribeFailHandler(addTopic, err)
 		}
@@ -412,7 +424,9 @@ func (t *FireTower) bindTopic(topic []string) ([]string, error) {
 	t.mutex.Lock()
 	if t.isClose {
 		t.mutex.Unlock()
-		revertSubscribe(routes)
+		// 登记期间连接关掉了。Close 当时还看不到这次订阅，这里要自己把 Manager 上的人数改回去。
+		backCounts, backVersions := revertSubscribe(routes)
+		_ = unsubscribeAll(routes, backCounts, backVersions)
 		return addTopic, ErrorClose
 	}
 	if t.route == nil {
@@ -427,6 +441,12 @@ func (t *FireTower) bindTopic(topic []string) ([]string, error) {
 		bucket.AddSubscribe(key, t)
 	}
 	return addTopic, nil
+}
+
+// reservedTopic 这两个名字是 Gateway 和 Manager 之间握手、对账用的，客户端不能订阅也不能发布。
+// 片键的分隔符也只在框架内部出现，客户端自己拼片键会绕过分组、把人数带歪。
+func reservedTopic(name string) bool {
+	return name == socket.HandshakeTopic || name == socket.EpochTopic || strings.Contains(name, groupSep)
 }
 
 func (t *FireTower) unbindTopic(topic []string) ([]string, error) {
@@ -531,6 +551,15 @@ func (t *FireTower) Send(message *socket.SendMessage) error {
 		cloned.Context = &life
 	}
 	message = &cloned
+	// 内存紧张时，已经积压的队列不再接新消息，免得在两轮检查之间继续涨。正常连接的队列很短，不受影响。
+	if memPressure.Load() && len(ch) >= memBacklogMin(cap(ch)) {
+		noteSendDrop(t)
+		memTrimmed.Add(1)
+		if message.Type != socket.StateKey {
+			t.noteGap(parentTopic(message.Topic))
+		}
+		return errors.New("memory guard: backlog dropped")
+	}
 	// 非阻塞发送，防止慢消费者阻塞整个 Bucket 的分发。
 	// 向已关闭的队列发送会 panic，这里接住，只丢掉这一条。
 	if err := enqueueSend(ch, message); err != nil {
@@ -727,12 +756,13 @@ func (t *FireTower) Close() {
 		} else if unsub != nil {
 			fire := NewFireInfo(t, nil)
 			if fire != nil && fire.Context != nil {
-				unsub(fire.Context, delTopic)
+				// Close 可能由业务协程直接调用。两个回调各自接住 panic，一个出错不跳过另一个。
+				safeCall("unsubscribe handler", func() { unsub(fire.Context, delTopic) })
 			}
 		}
 	}
 	if offline != nil {
-		offline()
+		safeCall("offline handler", offline)
 	}
 }
 
@@ -809,6 +839,7 @@ func (t *FireTower) readLoop() {
 		if t.ws == nil {
 			return nil
 		}
+		t.touch()
 		return t.ws.SetReadDeadline(time.Now().Add(wait))
 	})
 	for {
@@ -817,6 +848,7 @@ func (t *FireTower) readLoop() {
 		if err != nil { // 断开连接
 			goto collapse // 出现问题烽火台直接坍塌
 		}
+		t.touch()
 		fire := NewFireInfo(t, nil) // 从对象池中获取消息对象 降低GC压力
 		fire.MessageType = messageType
 
@@ -940,6 +972,9 @@ func (t *FireTower) readDispose() {
 func (t *FireTower) Publish(fire *FireInfo) error {
 	if fire == nil || fire.Context == nil || fire.Message == nil {
 		return errors.New("empty publish")
+	}
+	if reservedTopic(fire.Message.Topic) {
+		return errors.New("reserved topic")
 	}
 	var first error
 	for _, key := range publishKeys(fire.Message.Topic) {

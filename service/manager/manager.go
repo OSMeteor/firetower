@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,6 +56,12 @@ func logManager(level, info string) {
 	fn := Logger
 	loggerMu.RUnlock()
 	if fn != nil {
+		// Logger 可以被业务替换，recover 里也会调用它。它自己 panic 时不能再往外抛。
+		defer func() {
+			if err := recover(); err != nil {
+				fmt.Printf("PANIC: manager logger recovered: %v\n", err)
+			}
+		}()
 		fn(level, info)
 	}
 }
@@ -191,6 +198,12 @@ func (t *topicGrpcService) CheckTopicExist(ctx context.Context, request *pb.Chec
 	}
 	_, ok := topicRelevance.Load(request.Topic)
 	if !ok {
+		topicMu.RLock()
+		grouped := len(groupListsLocked(request.Topic)) > 0
+		topicMu.RUnlock()
+		if grouped {
+			return &pb.CheckTopicExistResponse{Ok: true}, nil
+		}
 		// topic 没有存在订阅列表中直接过滤
 		return &pb.CheckTopicExistResponse{Ok: false}, nil
 	}
@@ -209,8 +222,59 @@ func (t *topicGrpcService) GetConnectNum(ctx context.Context, request *pb.GetCon
 	var num int64
 	if ok {
 		num = getConnectNum(asTopicList(value))
+	} else {
+		for _, l := range groupListsLocked(request.Topic) {
+			num += getConnectNum(l)
+		}
 	}
 	return &pb.GetConnectNumResponse{Number: num}, nil
+}
+
+// 房间按用户分片后（Gateway 的 SetTopicShards / [[group]]），Manager 上只有片键「房间名 + 分隔符 + 片号」。
+// 业务后端和管理命令仍然只知道房间名，所以按房间名找不到时在这里展开成各片。
+const (
+	groupSep       = "\x1f"
+	maxGroupShards = 256
+)
+
+// groupListsLocked 返回这个房间名下各片的订阅表。没有分片或本身就是片键时返回空。调用方持有 topicMu。
+func groupListsLocked(topic string) []*list.List {
+	if topic == "" || strings.Contains(topic, groupSep) {
+		return nil
+	}
+	var out []*list.List
+	for i := 0; i < maxGroupShards; i++ {
+		value, ok := topicRelevance.Load(topic + groupSep + strconv.Itoa(i))
+		if !ok {
+			continue
+		}
+		if l := asTopicList(value); l != nil {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+var lastMixedWarn atomic.Int64
+
+// noteMixedGroup 同一个房间既有整间登记又有分片登记，说明各 Gateway 的 [[group]] 配置不一致。
+// 这时按房间名的发布只会到整间那一部分。不改行为，只告警，每 10 秒最多一条。调用方持有 topicMu。
+func noteMixedGroup(topic string) {
+	parent := topic
+	if i := strings.Index(topic, groupSep); i >= 0 {
+		parent = topic[:i]
+		if _, whole := topicRelevance.Load(parent); !whole {
+			return
+		}
+	} else if len(groupListsLocked(topic)) == 0 {
+		return
+	}
+	now := time.Now().UnixNano()
+	prev := lastMixedWarn.Load()
+	if now-prev < int64(10*time.Second) || !lastMixedWarn.CompareAndSwap(prev, now) {
+		return
+	}
+	logManager("WARN", fmt.Sprintf("topic %q is registered both whole and in shards; check that every gateway has the same [[group]] config", parent))
 }
 
 func snapshotTargets(topic string) ([]*connectBucket, bool) {
@@ -218,7 +282,23 @@ func snapshotTargets(topic string) ([]*connectBucket, bool) {
 	defer topicMu.RUnlock()
 	value, ok := topicRelevance.Load(topic)
 	if !ok {
-		return nil, false
+		// 一台 Gateway 只收一帧，它自己再分给本机的各片。
+		lists := groupListsLocked(topic)
+		if len(lists) == 0 {
+			return nil, false
+		}
+		seen := map[*connectBucket]struct{}{}
+		var out []*connectBucket
+		for _, l := range lists {
+			for _, bucket := range targetsLocked(l) {
+				if _, dup := seen[bucket]; dup {
+					continue
+				}
+				seen[bucket] = struct{}{}
+				out = append(out, bucket)
+			}
+		}
+		return out, true
 	}
 	table := asTopicList(value)
 	if table == nil {
@@ -260,25 +340,31 @@ func (t *topicGrpcService) SubscribeTopic(ctx context.Context, request *pb.Subsc
 	defer leaveRegister()
 	topicMu.Lock()
 	defer topicMu.Unlock()
+	ip, ok := resolveKeyLocked(request.Ip)
+	if !ok {
+		// 这条连接已经断开。Gateway 重连后会按新的键整表重放。
+		return &pb.SubscribeTopicResponse{}, nil
+	}
 	if request.Round > 0 && request.RoundBegin {
-		openReconcile(request.Ip, request.Round)
+		openReconcile(ip, request.Round)
 	}
 	for i, topic := range request.Topic {
-		if topic == "" || request.Ip == "" || topic == socket.EpochTopic {
+		if topic == "" || ip == "" || topic == socket.EpochTopic {
 			if topic == socket.EpochTopic && len(request.Version) > i {
-				noteEpoch(request.Ip, request.Version[i])
+				noteEpoch(ip, request.Version[i])
 			}
 			continue
 		}
-		markReconcile(request.Ip, topic)
+		markReconcile(ip, topic)
+		noteMixedGroup(topic)
 		if len(request.Version) > 0 && request.Version[i] > 0 {
-			applyAbsolute(topic, request.Ip, request.Count[i], request.Version[i])
+			applyAbsolute(topic, ip, request.Count[i], request.Version[i])
 			continue
 		}
-		bumpTopic(topic, request.Ip)
+		bumpTopic(topic, ip)
 	}
 	if request.Round > 0 && request.RoundEnd {
-		finishReconcile(request.Ip, request.Round)
+		finishReconcile(ip, request.Round)
 	}
 	return &pb.SubscribeTopicResponse{}, nil
 }
@@ -301,17 +387,85 @@ func (t *topicGrpcService) UnSubscribeTopic(ctx context.Context, request *pb.UnS
 	defer leaveRegister()
 	topicMu.Lock()
 	defer topicMu.Unlock()
+	ip, ok := resolveKeyLocked(request.Ip)
+	if !ok {
+		return &pb.UnSubscribeTopicResponse{}, nil
+	}
 	for i, topic := range request.Topic {
-		if topic == "" || request.Ip == "" {
+		if topic == "" || ip == "" {
 			continue
 		}
 		if len(request.Version) > 0 && request.Version[i] > 0 {
-			applyAbsolute(topic, request.Ip, request.Count[i], request.Version[i])
+			applyAbsolute(topic, ip, request.Count[i], request.Version[i])
 			continue
 		}
-		dropOne(topic, request.Ip)
+		dropOne(topic, ip)
 	}
 	return &pb.UnSubscribeTopicResponse{}, nil
+}
+
+// 登记是 gRPC，连接是 TCP，两条路到达 Manager 的先后没有保证。下面两张表处理两种晚到的登记：
+//   - keyAlias：握手确认前 Gateway 用本地地址登记。这样的请求可能在 rebind 之后才到，
+//     这时地址键已经没有连接。把它记到这条连接现在的路由键上，否则这些人数会一直留着。
+//   - deadKeys：连接已经断开，它的键下面的登记都清掉了。之后才到的登记不能再写回去，
+//     路由键每次重连都会变，没有连接会再来认领它。
+//
+// 两张表都由 topicMu 保护。
+var (
+	keyAlias = map[string]string{}
+	deadKeys = map[string]int64{}
+)
+
+const (
+	maxDeadKeys = 8192
+	deadKeyTTL  = 10 * time.Minute
+)
+
+// resolveKeyLocked 返回这次登记应当写到哪个键下。第二个返回值为假表示这个键属于已断开的连接，登记要丢掉。
+func resolveKeyLocked(ip string) (string, bool) {
+	if ip == "" {
+		return ip, true
+	}
+	if to, ok := keyAlias[ip]; ok && to != "" {
+		ip = to
+	}
+	if _, dead := deadKeys[ip]; dead {
+		return "", false
+	}
+	return ip, true
+}
+
+func buryKeyLocked(key string) {
+	if key == "" {
+		return
+	}
+	now := time.Now().UnixNano()
+	if len(deadKeys) >= maxDeadKeys {
+		for k, at := range deadKeys {
+			if now-at > int64(deadKeyTTL) {
+				delete(deadKeys, k)
+			}
+		}
+		if len(deadKeys) >= maxDeadKeys {
+			deadKeys = map[string]int64{}
+		}
+	}
+	deadKeys[key] = now
+	delete(keyAlias, key)
+	for from, to := range keyAlias {
+		if to == key {
+			delete(keyAlias, from)
+		}
+	}
+}
+
+// claimKeyLocked 在一条新连接开始使用某个键时调用。
+func claimKeyLocked(key string) {
+	if key == "" {
+		return
+	}
+	delete(deadKeys, key)
+	delete(keyAlias, key)
 }
 
 func bumpTopic(topic, ip string) {
@@ -563,6 +717,7 @@ const gatewayWriteTimeout = 5 * time.Second
 // StartSocketService 启动tcp服务
 // 主要用来接收gateway的推送消息
 func (m *Manager) StartSocketService(addr string) {
+	autoMemoryGuard()
 	serveSocket(addr, nil, nil)
 }
 
@@ -702,13 +857,23 @@ func (c *connectBucket) rebind(key string) {
 	}
 	c.routeKey = key
 	c.mu.Unlock()
-	if prevKey != "" && prevKey != key {
-		ConnIndexTable.CompareAndDelete(prevKey, c)
-		// 握手前按地址登记的条目留在旧键上。重放会按新键再登记，这里先把旧键清掉，避免人数一直偏大。
+	func() {
 		topicMu.Lock()
-		forgetIPLocked(prevKey)
-		topicMu.Unlock()
-	}
+		defer topicMu.Unlock()
+		claimKeyLocked(key)
+		if prevKey != "" && prevKey != key {
+			ConnIndexTable.CompareAndDelete(prevKey, c)
+			// 握手前按地址登记的条目留在旧键上。重放会按新键再登记，这里先把旧键清掉，避免人数一直偏大。
+			forgetIPLocked(prevKey)
+			// 之后才到的、仍然写着旧键的登记，记到新键上。
+			keyAlias[prevKey] = key
+			for from, to := range keyAlias {
+				if to == prevKey {
+					keyAlias[from] = key
+				}
+			}
+		}
+	}()
 	swapped, loaded := ConnIndexTable.Swap(key, c)
 	noteIdentity(key)
 	if !loaded || swapped == nil || swapped == c {
@@ -783,6 +948,11 @@ func (c *connectBucket) relation() {
 	if ip == "" {
 		return
 	}
+	func() {
+		topicMu.Lock()
+		defer topicMu.Unlock()
+		claimKeyLocked(ip)
+	}()
 	prev, loaded := ConnIndexTable.Swap(ip, c)
 	logManager("INFO", fmt.Sprintf("new connection: %s", ip))
 	if !loaded || prev == nil || prev == c {
@@ -805,6 +975,11 @@ func (c *connectBucket) delRelation() {
 	defer topicMu.Unlock()
 	for _, ip := range keys {
 		forgetIPLocked(ip)
+		// 同一个键已经被另一条连接接手时（地址被复用），不能把它标成已断开。
+		if cur, ok := ConnIndexTable.Load(ip); ok && cur != nil && cur != any(c) {
+			continue
+		}
+		buryKeyLocked(ip)
 	}
 }
 
@@ -921,6 +1096,13 @@ func (c *connectBucket) deliver(b []byte) {
 	conn := c.conn
 	c.mu.Unlock()
 	if ch != nil {
+		// 内存紧张时积压超过 1/4 的队列不再接新帧。
+		if memPressure.Load() && len(ch) >= cap(ch)/4 {
+			gatewayDrops.Add(1)
+			memDropped.Add(1)
+			noteOutbox(ch)
+			return
+		}
 		payload := append([]byte(nil), b...)
 		select {
 		case ch <- payload:
@@ -1033,8 +1215,14 @@ func (c *connectBucket) sendLoop() {
 			if message == nil || message.Context == nil {
 				continue
 			}
-			if message.Type == "handshake" || message.Topic == socket.HandshakeTopic {
+			if message.Type == "handshake" && message.Topic == socket.HandshakeTopic {
 				c.acceptHandshake(message)
+				continue
+			}
+			// 保留 Topic 只给握手和对账用。客户端经 Gateway 发布到这两个名字的帧不能当成握手，
+			// 否则一条 WebSocket 连接就能改掉整台 Gateway 的路由键。
+			if message.Type == "handshake" || message.Topic == socket.HandshakeTopic || message.Topic == socket.EpochTopic {
+				message.Recycling()
 				continue
 			}
 			targets, ok := snapshotTargets(message.Topic)

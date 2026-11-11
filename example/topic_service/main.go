@@ -26,6 +26,17 @@ func main() {
 		fmt.Println("config load failed")
 		return
 	}
+	// 内存保护默认开启，上限按机器自动取。topicmanage.toml 里可以用 [memory] limitMB 指定上限，
+	// 或者 disable = true 关掉。
+	if ConfigTree != nil {
+		if off, ok := ConfigTree.Get("memory.disable").(bool); ok && off {
+			manager.DisableMemoryGuard()
+		} else if limit, ok := ConfigTree.Get("memory.limitMB").(int64); ok && limit > 0 {
+			hard, _ := ConfigTree.Get("memory.hardPercent").(int64)
+			critical, _ := ConfigTree.Get("memory.criticalPercent").(int64)
+			manager.EnableMemoryGuard(int(limit), int(hard), int(critical))
+		}
+	}
 	m := &manager.Manager{}
 	go func() {
 		defer func() {

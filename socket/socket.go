@@ -571,7 +571,14 @@ func (t *TcpClient) WaitHandshake(timeout time.Duration) bool {
 }
 
 func (t *TcpClient) send(message []byte) error {
-	if t == nil || t.sendOut == nil || t.isClose {
+	if t == nil || t.sendOut == nil {
+		return ErrorClose
+	}
+	// isClose 由重连协程在 mutex 下改写，这里也要在锁下读。
+	t.mutex.Lock()
+	closed := t.isClose
+	t.mutex.Unlock()
+	if closed {
 		return ErrorClose
 	}
 	// 设置一秒超时

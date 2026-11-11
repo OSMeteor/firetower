@@ -5,7 +5,7 @@
   <a href="https://goreportcard.com/report/github.com/OSMeteor/firetower"><img tag="github.com/OSMeteor/firetower" src="https://goreportcard.com/badge/github.com/OSMeteor/firetower"></a>
   <img src="https://img.shields.io/badge/build-passing-brightgreen.svg" alt="Build Status">
   <img src="https://img.shields.io/badge/package%20utilities-go modules-blue.svg" alt="Package Utilities">
-  <img src="https://img.shields.io/badge/golang-1.11.0-%23ff69b4.svg" alt="Version">
+  <img src="https://img.shields.io/badge/golang-1.24-%23ff69b4.svg" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-brightgreen.svg" alt="license">
 </p>
 <h1 align="center">Firetower</h2>
@@ -13,20 +13,28 @@ firetower是一个用golang开发的分布式推送(IM)服务
 
 完全基于websocket封装，围绕topic进行sub/pub    
 自身实现订阅管理服务，无需依赖redis  
-聊天室demo体验地址: http://chat.ojbk.io  
+聊天室demo体验地址（原项目提供）: http://chat.ojbk.io  
+### 关于本仓库
+本仓库最初 fork 自 [holdno/firetower](https://github.com/holdno/firetower)，感谢原作者。现在它是一条独立维护的分支：  
+- 代码已经和上游分开演进，不再同步上游的改动，也不保证和上游的版本互相兼容。  
+- 模块路径是 `github.com/OSMeteor/firetower`，问题和改动请提到本仓库。  
+- 许可证沿用 MIT，保留原作者的版权声明，见 [LICENSE](LICENSE)。  
+- 文中的 logo、架构图和聊天室 demo 地址来自原项目，不由本仓库维护。  
 ### 可用版本
-go get github.com/OSMeteor/firetower@v0.5.1  
+go get github.com/OSMeteor/firetower@v0.6.0  
+
+主分支上后续的改动（见下文「系统架构与扩容阶段」）还没有发布成新的版本号。  
 ### 构成
 
 基本服务由两点构成  
 - topic管理服务  
-> 详见示例 example/topicService  
+> 详见示例 example/topic_service  
 
 该服务主要作为集群环境下唯一的topic管理节点  
 firetower一定要依赖这个管理节点才能正常工作  
 大型项目可以将该服务单独部署在一台独立的服务器上，小项目可以同连接层服务一起部署在一台机器上  
 - 连接层服务(websocket服务)  
-> 详见示例 example/websocketService  
+> 详见示例 example/websocket_service  
 
 websocket服务是用户基于firetower自定义开发的业务逻辑  
 可以通过firetower提供的回调方法来实现自己的业务逻辑  
@@ -40,7 +48,7 @@ package main
 import (
     "fmt"
     "github.com/gorilla/websocket"
-    "github.com/OSMeteor/firetower/gateway"
+    "github.com/OSMeteor/firetower/service/gateway"
     "github.com/holdno/snowFlakeByGo" // 这是一个分布式全局唯一id生成器
     "net/http"
     "strconv"
@@ -59,6 +67,8 @@ func main() {
     // 如果是集群环境  一定一定要给每个服务设置唯一的id
     // 取值范围 1-1024
     gateway.ClusterId = 1
+    // 读取工作目录下的 fireTower.toml，建立到 topic 管理服务的连接。必须先调用
+    gateway.Init()
     http.HandleFunc("/ws", Websocket)
     fmt.Println("websocket service start: 0.0.0.0:9999")
     http.ListenAndServe("0.0.0.0:9999", nil)
@@ -72,6 +82,10 @@ func Websocket(w http.ResponseWriter, r *http.Request) {
     // 生成一个全局唯一的clientid 正常业务下这个clientid应该由前端传入
     id := GlobalIdWorker.GetId()
     tower := gateway.BuildTower(ws, strconv.FormatInt(id, 10)) // 生成一个烽火台
+    if tower == nil { // 还没连上 topic 管理服务，或连接数已到上限
+        ws.Close()
+        return
+    }
     tower.Run()
 }
 ```
@@ -80,12 +94,12 @@ func Websocket(w http.ResponseWriter, r *http.Request) {
 ``` golang
 tower := gateway.BuildTower(ws, strconv.FormatInt(id, 10)) // 创建beacontower实例
 tower.SetReadHandler(func(fire *gateway.FireInfo) bool { // 绑定ReadHandler回调方法
-    // message.Data 为客户端传来的信息
-    // message.Topic 为消息传递的topic
+    // fire.Message.Data 为客户端传来的信息
+    // fire.Message.Topic 为消息传递的topic
     // 用户可在此做发送验证
     // 判断发送方是否有权限向到达方发送内容
-    // 通过 Publish 方法将内容推送到所有订阅 message.Topic 的连接
-    tower.Publish(message)
+    // 通过 Publish 方法将内容推送到所有订阅 fire.Message.Topic 的连接
+    tower.Publish(fire)
     return true
 })
 ```
@@ -139,61 +153,35 @@ tower.SetUnSubscribeHandler(func(context *gateway.FireLife, topic []string) bool
 ```
 注意：当客户端断开websocket连接时firetower会将其在线时订阅的所有topic进行退订 会触发UnSubscirbeHandler  
 
-## 系统架构与无限扩展指南 (System Architecture & Scalability Guide)
+## 系统架构与扩容阶段
 
-Firetower 采用 **Gateway (接入层)** + **TopicManager (逻辑控制层)** 的分离架构设计。这种设计天生具备良好的扩展性。本指南将阐述如何从单机 Docker 部署演进到支撑百万级在线用户的分布式集群。
+Firetower 采用 **Gateway (接入层)** + **TopicManager (逻辑控制层)**。在线连接在 Gateway，Topic 到 Gateway 的路由在 Manager 内存里，不依赖 Redis、Kafka 等外部组件。
+
+**当前状态：v0.6.0 的并发修复、故障恢复、多 Manager、Topic 分片和内存保护已在 Linux 与 Windows 上通过竞态检测、单元测试、模糊测试和真实进程的阶段 2/3/4 测试（单机）。** 测试项和结果见 [docs/release-test-plan.md](docs/release-test-plan.md)。容量数字以压测结果为准，不作为 SLA。
 
 ### 1. 核心组件
 *   **Gateway (Websocket Service)**:
-    *   **职责**: 维护海量 WebSocket 长连接，处理协议封包/解包，执行消息广播。
-    *   **特性**: 仅处理连接逻辑，几乎无状态（订阅关系同步给 TM），**可无限水平扩展**。针对慢连接实现了非阻塞广播和自动丢包保护。
+    *   **职责**: 维护 WebSocket 长连接，处理协议封包/解包，把消息写给本机的订阅者。
+    *   **特性**: 订阅关系按 Gateway 登记到 Manager。发送队列满时丢弃该连接上的这一条，不阻塞其他连接。投递语义是至多一次。
 *   **TopicManager (Topic Service)**:
-    *   **职责**: 管理 Topic -> Gateway 节点的映射关系，接收 Publish 请求并分发给持有该 Topic 订阅者的所有 Gateway。
-    *   **特性**: 目前为单点状态节点 (Stateful)，是扩展的瓶颈所在。
+    *   **职责**: 管理 Topic -> Gateway 的映射，接收发布并转发给持有该 Topic 订阅者的 Gateway。
+    *   **特性**: 状态全在内存里，重启后由各 Gateway 重放订阅来重建。
 
-### 2. 演进路线图
+### 2. 接入方式不变
+客户端协议（`topic` / `data` / `type` 的 JSON 文本帧）和上文的回调接口保持不变。新增的能力都是默认关闭或对接入方不可见的。
 
-#### 阶段一：单机/小规模集群 (Current)
-*   **适用场景**: < 50,000 在线用户，业务量适中。
-*   **部署**:
-    *   1个 TopicManager 实例。
-    *   N个 Gateway 实例 (N >= 2)，通过 Nginx/SLB 做 4层或7层负载均衡。
-    *   Gateway 启动时通过配置指向唯一的 TopicManager IP。
+### 3. 代码里已有的能力
+*   **故障恢复**: Gateway 到 Manager 的 TCP 断开后带抖动重连，重连后自动重放本机订阅，客户端不用重新订阅。登记带绝对人数和版本号，重放是幂等的。
+*   **故障检测**: Gateway 读 Manager 有读超时，Manager 写 Gateway 有写超时，一台慢的 Gateway 不拖住其他。
+*   **保护**: 关键协程有 recover；每帧和每连接的 Topic 数、总连接数有上限。
+*   **多 Manager**: 配置里可以列出多台 Manager，订阅向每一台登记，发布按 Topic 哈希选一台。只配一台时行为和以前相同。
+*   **默认关闭的可选项**: 缺失提示帧、被动订阅、热点 Topic 独立队列、房间分片、订阅失败回调。
 
-#### 阶段二：TopicManager 分片 (Sharding)
-*   **适用场景**: < 500,000 在线用户，Topic 数量巨大。
-*   **改造方案**:
-    *   部署 M 个 TopicManager 节点。
-    *   **Gateway 改造**: 在连接 TM 时，不再连接单一节点，而是连接 TM 集群。
-    *   **路由算法**: 采用一致性哈希 (Consistent Hashing) 或 `Hash(Topic) % M` 算法。
-        *   当订阅 `Topic_A` 时，Gateway 计算 Hash 路由到 `TM_Node_1` 进行注册。
-        *   当发布 `Topic_A` 时，Gateway 同样路由到 `TM_Node_1` 进行发布。
-    *   **效果**: 将订阅关系管理的内存压力和匹配计算的 CPU 压力分散到集群中。
-
-#### 阶段三：无状态化与中间件集成 (Stateless & Middleware)
-*   **适用场景**: > 1,000,000 在线用户 (百万级并发)。
-*   **核心痛点**: 此时自研的 TopicManager 可能成为维护负担，且有状态服务的扩容迁移复杂。
-*   **改造方案**:
-    *   **移除 TopicManager**：完全废弃自研的 TopicManager 服务。
-    *   **引入 Redis Pub/Sub (或 Kafka/NATS)**：使用成熟的消息中间件作为 Topic 路由中心。
-    *   **Gateway 行为**:
-        *   用户订阅 `Topic_A` -> Gateway 直接向 Redis 订阅 `Channel_A`。
-        *   收到 Redis `Channel_A` 消息 -> Gateway 广播给本机所有订阅了 `Topic_A` 的 WebSocket 连接。
-    *   **优势**: 彻底利用云厂商提供的 Redis 集群能力，Gateway 变为完全无状态的纯连接层，实现真正的**无限水平扩展**。
-
-#### 阶段四：千万级超大规模 (Hierarchical Routing)
-*   **适用场景**: 各国头部 APP (如 WhatsApp, 微信)。
-*   **改造方案**:
-    *   **Bucket 预分片**: 引入 "Slot" 概念 (如 16384 个 Slot)。
-    *   **二级路由**: 建立 `Slot -> Gateway_IP_List` 的全局映射表 (存储在 Etcd/ZooKeeper)。
-    *   **边缘计算**: 消息先推送到 Slot 对应的“分发层”，再由分发层并行推送到具体的 Gateway 节点。
-
-### 3. 稳定性保障 (已实装)
-为支撑上述扩展，本项目在代码层面已实装以下企业级特性：
-*   **Panic Recovery**: 关键协程全覆盖，单点故障不扩散。
-*   **Non-blocking Send**: 防止慢消费者（弱网用户）拖死服务子系统。
-*   **Exponential Backoff**: 指数退避重连，防止服务重启时的流量雪崩。
-*   **Zero-Copy Logic**: 协议层优化，支撑高吞吐。
+### 4. 文档
+*   [docs/architecture.md](docs/architecture.md)、[docs/network-communication.md](docs/network-communication.md): 组件和消息流转。
+*   [docs/scale-plan.md](docs/scale-plan.md): 各阶段的做法、在线人数估算、大房间、部署与配置。其中「当前代码与改法」一节写于这批改动之前，部分条目已经实现。
+*   [docs/release-test-plan.md](docs/release-test-plan.md): 上线前要跑的测试。
+*   [docs/pain-points.md](docs/pain-points.md): 其他公司公开分享的事故和架构材料。
  
 ## TODO
 - 运行时web看板  

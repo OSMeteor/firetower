@@ -1,7 +1,6 @@
 package socket
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/binary"
 	"sync/atomic"
@@ -55,10 +54,7 @@ func Enpack(pushType, messageId, source, topic string, content []byte) ([]byte, 
 // Depack 解包
 func Depack(buffer []byte, readerChannel chan *SendMessage) ([]byte, error) {
 	length := len(buffer)
-	var (
-		i   int
-		err error
-	)
+	var i int
 	for i = 0; i < length; {
 		// 首先判断是否是一个完整的包
 		// 最小长度 check
@@ -78,43 +74,27 @@ func Depack(buffer []byte, readerChannel chan *SendMessage) ([]byte, error) {
 
 			// 提取数据段
 			data := buffer[i+ConstHeaderLength+ConstIntLength : i+ConstHeaderLength+ConstIntLength+messageLength]
-			reader := bufio.NewReader(bytes.NewReader(data))
-
-			var (
-				params  [][]byte
-				param   []byte
-				content = make([]byte, messageLength)
-				n       int
-			)
-
-			param, _, err = reader.ReadLine()
-			if err != nil {
-				// 读取出错，可能是包体有问题，稍微跳过一个字节继续寻找？
-				// 或者直接认为这个包损坏，跳过整个长度？
-				// 为了稳妥，如果我们确认了头部和长度，应该跳过这个包
+			// 第一行是参数，换行之后全部是正文。不能用 bufio.Reader 读正文：它一次最多交出 4096 字节，
+			// 超过的部分会被悄悄截掉（以前就是这样把大于 4KB 的消息截短了）。
+			if messageLength == 0 {
 				i += ConstHeaderLength + ConstIntLength + messageLength
 				continue
 			}
-
-			params = bytes.Split(param, []byte(ConstSplitSpace))
-			n, err = reader.Read(content)
-			if err != nil && err.Error() != "EOF" { // Read might return EOF if content is exactly what's left
-				i += ConstHeaderLength + ConstIntLength + messageLength
-				continue
+			param := data
+			var body []byte
+			if nl := bytes.IndexByte(data, ConstNewLine); nl >= 0 {
+				param = data[:nl]
+				body = data[nl+1:]
 			}
-			// content should take n bytes.
-			// Wait, reader.Read(content) reads UP TO len(content).
-			// Since we created reader from fixed size data, it should read it all.
-
-			// Re-assemble params
-			if len(params) > 0 {
-				params = append(params, content[:n])
+			if n := len(param); n > 0 && param[n-1] == '\r' {
+				param = param[:n-1]
 			}
+			params := bytes.Split(param, []byte(ConstSplitSpace))
+			// 正文要复制出来，data 指向的缓冲之后会被复用。
+			params = append(params, append(make([]byte, 0, len(body)), body...))
 
 			if len(params) < 3 {
-				// 包解析发生错误
-				err = errors.New("包解析出错")
-				// 仅仅记录错误，不返回，继续解析后续
+				// 包解析发生错误，跳过这一帧继续解析后续
 				i += ConstHeaderLength + ConstIntLength + messageLength
 				continue
 			}
