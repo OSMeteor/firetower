@@ -1,5 +1,10 @@
 # 更新日志 (Change Log)
 
+## [未发布] 文档
+
+- 新增 `docs/deploy.md` 运维部署手册（单机、多 Gateway、多 Manager、大房间分片四个场景）。README、architecture、network-communication、scale-plan 按 v0.6 的实际行为更新，加了整体架构图。
+- 注明依赖要求：`google.golang.org/grpc` 需要 v1.25 及以上。
+
 ## [v0.6.0] - 2026-11-11
 
 ### 进程不崩 (Crash safety)

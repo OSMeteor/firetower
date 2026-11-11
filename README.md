@@ -23,7 +23,9 @@ firetower是一个用golang开发的分布式推送(IM)服务
 ### 可用版本
 go get github.com/OSMeteor/firetower@v0.6.0  
 
-主分支上后续的改动（见下文「系统架构与扩容阶段」）还没有发布成新的版本号。  
+依赖要求：`google.golang.org/grpc` v1.25 及以上。项目的 go.mod 里如果有把 grpc `replace` 到更老版本（例如 v1.20.1）的行，要先升级或去掉，否则会报找不到 `google.golang.org/grpc/backoff`。  
+
+各版本的改动见 [Change_Log.md](Change_Log.md)。  
 ### 构成
 
 基本服务由两点构成  
@@ -40,6 +42,32 @@ websocket服务是用户基于firetower自定义开发的业务逻辑
 可以通过firetower提供的回调方法来实现自己的业务逻辑  
 （web client 在 example/web 下)  
 ### 架构图  
+v0.6.0 的整体结构（多 Gateway、多 Manager 都是可选的，只配一台 Manager 时和以前一样）：
+
+```mermaid
+flowchart LR
+    subgraph CL["客户端"]
+        C1["浏览器 / App"]
+        C2["浏览器 / App"]
+    end
+    subgraph GW["接入进程（可多台，ClusterId 各不相同）"]
+        G1["Gateway 1<br/>Bucket 本地订阅 · 业务回调 · 内存保护"]
+        G2["Gateway 2"]
+    end
+    subgraph TM["Topic Manager（一台或多台）"]
+        M1["Manager A<br/>Topic → Gateway 路由（内存）"]
+        M2["Manager B（可选）"]
+    end
+    C1 -- WebSocket --> G1
+    C2 -- WebSocket --> G2
+    G1 -- "gRPC 6667：订阅登记 / 断线后重放" --> M1
+    G1 -- "TCP 6666：发布、下行推送、心跳" --> M1
+    G2 --> M1
+    G1 -. "多 Manager 时向每台登记，发布按 Topic 哈希选一台" .-> M2
+    G2 -.-> M2
+```
+
+单台 Gateway 内部的消息路径见原项目的图（不含多 Manager、分片和内存保护）：  
 ![beacontower](http://img.holdno.com/github/holdno/firetower_process.png)  
 ### 接入姿势  
 ``` golang 
@@ -78,11 +106,14 @@ func Websocket(w http.ResponseWriter, r *http.Request) {
     // 做用户身份验证
     ...
     // 验证成功才升级连接
-    ws, _ := upgrader.Upgrade(w, r, nil)
+    ws, err := upgrader.Upgrade(w, r, nil)
+    if err != nil {
+        return
+    }
     // 生成一个全局唯一的clientid 正常业务下这个clientid应该由前端传入
     id := GlobalIdWorker.GetId()
     tower := gateway.BuildTower(ws, strconv.FormatInt(id, 10)) // 生成一个烽火台
-    if tower == nil { // 还没连上 topic 管理服务，或连接数已到上限
+    if tower == nil { // 还没连上 topic 管理服务、连接数已到上限、内存保护拒绝新连接或正在下线
         ws.Close()
         return
     }
@@ -168,19 +199,25 @@ Firetower 采用 **Gateway (接入层)** + **TopicManager (逻辑控制层)**。
     *   **特性**: 状态全在内存里，重启后由各 Gateway 重放订阅来重建。
 
 ### 2. 接入方式不变
-客户端协议（`topic` / `data` / `type` 的 JSON 文本帧）和上文的回调接口保持不变。新增的能力都是默认关闭或对接入方不可见的。
+客户端协议（`topic` / `data` / `type` 的 JSON 文本帧）和上文的回调接口保持不变。新增的能力除内存保护外都是默认关闭或对接入方不可见的。
+
+接入方唯一要注意的一点：内存保护默认开启，内存紧张时 `BuildTower` 会返回 `nil`（和连接数到上限时一样），调用方必须判断并 `ws.Close()`，见上文示例。
 
 ### 3. 代码里已有的能力
 *   **故障恢复**: Gateway 到 Manager 的 TCP 断开后带抖动重连，重连后自动重放本机订阅，客户端不用重新订阅。登记带绝对人数和版本号，重放是幂等的。
 *   **故障检测**: Gateway 读 Manager 有读超时，Manager 写 Gateway 有写超时，一台慢的 Gateway 不拖住其他。
-*   **保护**: 关键协程有 recover；每帧和每连接的 Topic 数、总连接数有上限。
-*   **多 Manager**: 配置里可以列出多台 Manager，订阅向每一台登记，发布按 Topic 哈希选一台。只配一台时行为和以前相同。
+*   **保护**: 关键协程、用户回调和日志回调都有 recover，出问题只关闭那一条连接；每帧和每连接的 Topic 数、总连接数有上限。握手、对账用的保留 Topic 不对客户端开放。
+*   **内存保护（默认开启）**: Gateway 和 Manager 每 100ms 读一次存活堆，不强制 GC。上限优先取配置 `[memory] limitMB`，不配置时自动取 GOMEMLIMIT、cgroup 和物理内存中最小的一个，`disable = true` 关闭。70% 拒绝新连接，85% 起按积压、不活跃、连接时长清理连接，持续有心跳或消息的连接不会被清理。详见 [docs/scale-plan.md](docs/scale-plan.md) 的「内存保护」。
+*   **订阅登记**: 登记 RPC 超时按 500ms、1s、2s 重试。Manager 慢或暂时不可用时订阅先留在本机，由后台重放补登记，不会丢。
+*   **多 Manager**: 配置里用 `[[manager]]` 列出多台，订阅向每一台登记，发布按 Topic 做最高随机权重哈希选一台。只配一台时行为和以前相同。
+*   **房间分片**: `[[group]]` 或 `SetTopicShards` 把大房间拆成多片，客户端和业务后端仍只用房间名。默认关闭。
 *   **默认关闭的可选项**: 缺失提示帧、被动订阅、热点 Topic 独立队列、房间分片、订阅失败回调。
 
 ### 4. 文档
 *   [docs/architecture.md](docs/architecture.md)、[docs/network-communication.md](docs/network-communication.md): 组件和消息流转。
-*   [docs/scale-plan.md](docs/scale-plan.md): 各阶段的做法、在线人数估算、大房间、部署与配置。其中「当前代码与改法」一节写于这批改动之前，部分条目已经实现。
-*   [docs/release-test-plan.md](docs/release-test-plan.md): 上线前要跑的测试。
+*   [docs/scale-plan.md](docs/scale-plan.md): 各阶段的做法、在线人数估算、大房间、部署与配置。「当前代码与改法」一节里标「v0.6.0 已实现」的条目已包含在 v0.6.0 中。
+*   [docs/deploy.md](docs/deploy.md): 给运维的部署手册：各场景的机器规划、配置模板、增减 Manager 的步骤、上线检查清单、告警和故障处理。
+*   [docs/release-test-plan.md](docs/release-test-plan.md): 上线前要跑的测试和 v0.6.0 的测试结果（含 `cmd/stagecheck` 真实进程测试）。
 *   [docs/pain-points.md](docs/pain-points.md): 其他公司公开分享的事故和架构材料。
  
 ## TODO

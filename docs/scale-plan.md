@@ -2,7 +2,7 @@
 
 **状态：待实施的方案，不是已完成功能。** 评估以本文为准。`docs/architecture.md` 和 `docs/network-communication.md` 只描述当前代码。`Whitepaper.md` 与旧版 `Scalability_Guide.md` 里的人数和中间件路线不参与评估。外部公司的事故和架构材料单独放在 [pain-points.md](pain-points.md)。
 
-本文的每一条改法都对着现有函数写。核对的代码是 `service/gateway/tower.go`、`service/gateway/bucket.go`、`service/gateway/manager_client.go`、`service/manager/manager.go`、`socket/socket.go`、`socket/protocol.go`、`grpc/manager/topicmanage.proto`，以及三处 `audit_*_test.go`。核对的基线是提交 `682da3f`。工作区里未提交的修改（查看时间 2026-11-10 13:33）已经标在表里。标了「工作区已改」的行，提交并跑过对应用例后可以删掉。
+本文的每一条改法都对着现有函数写。核对的代码是 `service/gateway/tower.go`、`service/gateway/bucket.go`、`service/gateway/manager_client.go`、`service/manager/manager.go`、`socket/socket.go`、`socket/protocol.go`、`grpc/manager/topicmanage.proto`，以及三处 `audit_*_test.go`。核对的基线是提交 `682da3f`。表里标「v0.6.0 已实现」的行已经随 v0.6.0 发布，并通过了对应用例和 `cmd/stagecheck`（见 [release-test-plan.md](release-test-plan.md)）。
 
 Firetower 是实时分发层：Gateway 持有 WebSocket，Manager 只保存 `Topic → Gateway 地址 + 计数`。一条消息走 Gateway 与 Manager 之间已经建立的 TCP（`6666`）。订阅和退订走 gRPC（`6667`）。不把 Redis 或 Kafka 放进扇出热路径。
 
@@ -29,7 +29,7 @@ Firetower 是实时分发层：Gateway 持有 WebSocket，Manager 只保存 `Top
 
 | 改动 | 接入方能不能看到 | 处理 |
 | :--- | :--- | :--- |
-| `ToSelf` 改为入队（工作区已改） | 签名不变。以前是同步写、返回写错误；现在是入队，队列满时返回错误，实际写出稍后发生 | 接受。这是消除并发写所必需的，写进发布说明 |
+| `ToSelf` 改为入队（v0.6.0 已实现） | 签名不变。以前是同步写、返回写错误；现在是入队，队列满时返回错误，实际写出稍后发生 | 接受。这是消除并发写所必需的，写进发布说明 |
 | 心跳只发 WebSocket Ping | 客户端不收到文本 `heartbeat`。`sendOut` 满只丢业务消息，不因此断开 | 保持。不把心跳塞进 `sendOut` |
 | 登记带绝对人数 | 看不到。`GetConnectNum` 的数值和现在一致 | — |
 | 订阅上报改成 0↔1 | 能。`GetConnectNum` 会滞后一个同步周期，示例在订阅回调里立刻读它来广播人数 | 和本节冲突，默认不做。后果见「各阶段的在线人数」：阶段 3 只提高发布吞吐，不提高在线上限 |
@@ -66,24 +66,24 @@ Firetower 框架只做至多一次的路由。可靠聊天需要的消息身份�
 
 | 位置 | 现在的行为 | 改法 | 验收 |
 | :--- | :--- | :--- | :--- |
-| `TowerManager.dispatch`、`socket.GetSendMessage` | 同一个 `*SendMessage` 被送进每个 Bucket，随后立刻 `Recycling()` 放回池子。慢连接队列里还没写出的消息，会被池子复用成别的 Topic 的内容 | **工作区已改，未提交。** `dispatch` 经 `cloneSendMessage` 给每个 Bucket 一份副本，正文和 `Context` 都单独拷贝。`Recycling` 不再入池，`GetSendMessage` 直接新建。`sendLoop` 用局部变量决定 WebSocket 帧类型，不写共享对象的 `MessageType` | ✓ `FT03_QueuedMessageKeepsPayload`、✓ `CO03_PoolGetClearsPayload`、✓ `CO06_SendLoopLeavesMessageType` |
-| `FireTower.ToSelf` | 直接调用 `ws.WriteMessage`，和 `sendLoop` 并发写同一条 WebSocket。`Bucket.unSubscribeByUserId` 也从消费者协程里调用它 | **工作区已改，未提交。** `ToSelf` 改为拷贝正文后经 `Send` 入队。`FT08` 用例同时改成了检查队列长度 | ✓ `FT08_ToSelfIsQueued`、✓ `CO02_SingleWriter`（2026-11-10 本机） |
-| `connectBucket.sendLoop`（Manager） | 写某一台 Gateway 失败后关闭对方并 `return`。退出的是**收到这帧的那条连接**的发送循环，之后这台 Gateway 发来的帧先堆满 `packetChan`（1024），再被 `Depack` 丢弃 | **工作区已改，未提交。** 写失败只 `close` 那一台，然后 `continue`。取目标走 `snapshotTargets`，读锁用 `defer` 释放 | ✓ `NW07_FailedWriteDoesNotStopPublisher` |
-| `topicGrpcService.Publish` 与 `connectBucket.sendLoop` | 发布有两条入口。业务 `Publish` 走 TCP，`sendLoop` 里串行 `conn.Write`。gRPC `Publish` 另写一遍。TCP 那条仍会因一台慢连接堵住这台 Gateway 发出的所有 Topic | **工作区已改，未提交。** 两条入口都经目标连接的 `outbox`。锁内只拷贝目标，锁外写 | ✓ `FT10_PublishWriteDoesNotBlockSubscribe`、✓ `NW06_SlowGatewayDoesNotBlockOthers`、✓ `FullOutboxDoesNotBlockPublisher` |
-| `connectBucket.sendLoop`、`delRelation`、`topicWebHandler` | 遍历 `topicRelevance` 里的链表时不持锁，而 `SubscribeTopic` 在 `t.mu` 下修改同一条链表 | **工作区已改，未提交。** `sendLoop`、`delRelation`、`getConnectNum`、`topicWebHandler` 都改为在 `topicMu` 下访问链表 | 普通 `go test` 下 `CO04_SubscribeRacesForward` 通过（2026-11-10）。`-race` 本机没有 gcc，还没跑 |
-| Manager 对 Gateway 的写出 | 每个发布方连接一个 `sendLoop`，串行 `conn.Write`，没有写超时。对端主机断电时写不会立刻失败，内核缓冲写满后这个 `sendLoop` 卡住，这台 Gateway 发布的所有 Topic 都停 | **工作区已改，未提交。** 每条接入的 Gateway 一条 4096 长的 `outbox` 和 `writeLoop`，写超时 5 秒。队列满就丢掉这一帧并计数，写失败只关闭这一台。没有 `outbox` 的连接仍直接写，现有用例不用改 | ✓ `FullOutboxDoesNotBlockPublisher`、✓ `FullOutboxIsCounted` |
-| `connectBucket.relation`、`close` | `ConnIndexTable` 在连接关闭后不删除。同一个地址再次出现时 `relation` 因为键已存在而不替换，新连接不会被索引 | **工作区已改，未提交。** `relation` 用 `Swap` 覆盖，并关掉被换下的旧连接。`close` 用 `CompareAndDelete`，只在表里的值仍是自己时删除 | ✓ `CO05_ReplacedConnKeepsIndex` |
-| `managerIP` | 先读 `topicManage.Conn` 再调 `LocalAddr()`，重连协程会在这两步之间把连接换掉 | **工作区已改，未提交。** 改为 `topicManage.CurrentAddr()`，空地址当错误 | ✓ `ManagerIPNilConn` |
-| 空调用 | `Publish`、`CheckTopicExist`、`GetConnectNum`、`TcpClient.Publish`、`relation` 遇到空指针会 panic。`relation` 跑在 Accept 循环里，一 panic 就不再接入新连接 | **工作区已改，未提交。** 空值返回错误或直接返回。一条坏连接只关掉自己，Accept 循环继续 | ✓ `TestStage0`（2026-11-10 本机） |
-| `socket.Depack` | 目标队列满时返回 `nil` 和错误，调用方把它当作剩余缓冲，这次读到的后续帧和半包一起丢掉 | **工作区已改，未提交。** 满队列只丢掉当前这一帧并计入 `DroppedFrames`，后面的帧和半包照常返回。非法长度仍拒绝整段，避免把坏长度当成半包一直攒 | ✓ `FullQueueKeepsTheFollowingBytes`、✓ `PR01_DepackDoesNotBlockWhenConsumerIsGone` |
-| `TcpClient.readLoopConn`（Gateway 侧） | 读 Manager 的 TCP 没有读超时。Manager 每 10 秒发的心跳帧在 `Read` 里被直接跳过，不用来计时。Manager 主机断电或网络中断时，Gateway 发现不了 | **工作区已改，未提交。** 在 `conn.Read` 上设 30 秒超时（3 个 10 秒心跳）。任何字节，包括心跳，都重新计时。超时走 `onConnLost`。不用 `fireTower.toml` 的 `heartbeat` | ✓ `ReadTimeoutReplacesSilentManager` |
-| `TcpClient.dialLoop`、`waitRetry` | 断线后固定等 1 秒重连，失败后也是固定 1 秒，没有抖动。`Change_Log.md` 写的指数退避只在 `manager_client.go` 的首次连接里 | **工作区已改，未提交。** 从 200ms 起倍增，封顶 30 秒，每次在一半到全额之间随机。`Shutdown` 在等待期间返回 | ✓ `RetryDelayIsJitteredAndCapped`、✓ `TC02_ShutdownStopsReconnect` |
-| `manager_client.go` 的 `OnPush` | `TM.centralChan <- sendMessage` 是阻塞发送。`centralChan` 满时，读 Manager 的循环停住。加上面的读超时后，这会被当成 Manager 断电，触发重连和全量重放 | **工作区已改，未提交。** 写不进就丢这一帧，不堵住读循环 | 随读超时一起用 |
-| 重连之后 | `swapConnLocked` 只换连接。Manager 已经按旧地址 `delRelation`，Gateway 不会把本机订阅再登记一次。WebSocket 没断，客户端不知道要重订，这台机器上的用户静默收不到消息 | **工作区已改，未提交。** `TcpClient.SetOnConnect` 在连接建立后回调。Gateway 用本机 `Topic → 人数` 表分块调用 `SubscribeTopic`。客户端不用重订 | ✓ `NW05_ReconnectReplaysSubscriptions` |
-| `SubscribeTopic`、`bindTopic` | 对同一地址每次 `num++`。超时重试或重放会让计数只增不减 | **工作区已改，未提交。** 请求带 `Count` 和 `Version`，和 `Topic` 一一对应。版本更新才盖写，更旧的丢掉，人数为 0 即删除。字段缺失时仍是 `num++`，旧 Gateway 不用改 | ✓ `AbsoluteCountOverwritesAndIgnoresStale`；✓ `FT09_SubscribeHasDeadline` 保留 |
-| `readDispose` 的 `subscribe` 分支 | `bindTopic` 失败只调用 `fire.Error` 写日志，不通知客户端 | **工作区已改，未提交。** `SetSubscribeFailHandler` 可选。不设置时仍只记日志，不回新帧，也不关连接 | ✓ `SubscribeFailHandler` |
-| `GetConnectNum`、`CheckTopicExist`（Gateway 侧） | 用 `context.Background()`，没有超时。示例的 `subscribeHandler` 在 `readDispose` 里调用 `GetConnectNum`，Manager 不响应时这条连接的读处理停住 | **工作区已改，未提交。** 这两次 RPC 使用和订阅一样的 500ms 超时 | ✓ `ManagerRPCDoesNotHang` |
-| 热路径日志 | `LogLevel` 默认 `INFO`。`dispatch` 的 `message.Info("Sended")`、`readDispose` 的 `fire.Info("Extinguished")`、Manager 的 `new message` 和 `topic manager sended` 每条消息都同步打印全文。`Send` 每丢一条打一次 `WARN`，`dispatch` 每丢一条 `Printf` 一次。慢连接多的时候日志本身先成为瓶颈 | **工作区已改，未提交。** 这几处正文每 1024 条打一条，其余只计数。`Send` 丢弃和 Bucket 丢弃每秒最多一条日志 | ✓ `HotLogIsSampled` |
+| `TowerManager.dispatch`、`socket.GetSendMessage` | 同一个 `*SendMessage` 被送进每个 Bucket，随后立刻 `Recycling()` 放回池子。慢连接队列里还没写出的消息，会被池子复用成别的 Topic 的内容 | **v0.6.0 已实现。** `dispatch` 经 `cloneSendMessage` 给每个 Bucket 一份副本，正文和 `Context` 都单独拷贝。`Recycling` 不再入池，`GetSendMessage` 直接新建。`sendLoop` 用局部变量决定 WebSocket 帧类型，不写共享对象的 `MessageType` | ✓ `FT03_QueuedMessageKeepsPayload`、✓ `CO03_PoolGetClearsPayload`、✓ `CO06_SendLoopLeavesMessageType` |
+| `FireTower.ToSelf` | 直接调用 `ws.WriteMessage`，和 `sendLoop` 并发写同一条 WebSocket。`Bucket.unSubscribeByUserId` 也从消费者协程里调用它 | **v0.6.0 已实现。** `ToSelf` 改为拷贝正文后经 `Send` 入队。`FT08` 用例同时改成了检查队列长度 | ✓ `FT08_ToSelfIsQueued`、✓ `CO02_SingleWriter`（2026-11-10 本机） |
+| `connectBucket.sendLoop`（Manager） | 写某一台 Gateway 失败后关闭对方并 `return`。退出的是**收到这帧的那条连接**的发送循环，之后这台 Gateway 发来的帧先堆满 `packetChan`（1024），再被 `Depack` 丢弃 | **v0.6.0 已实现。** 写失败只 `close` 那一台，然后 `continue`。取目标走 `snapshotTargets`，读锁用 `defer` 释放 | ✓ `NW07_FailedWriteDoesNotStopPublisher` |
+| `topicGrpcService.Publish` 与 `connectBucket.sendLoop` | 发布有两条入口。业务 `Publish` 走 TCP，`sendLoop` 里串行 `conn.Write`。gRPC `Publish` 另写一遍。TCP 那条仍会因一台慢连接堵住这台 Gateway 发出的所有 Topic | **v0.6.0 已实现。** 两条入口都经目标连接的 `outbox`。锁内只拷贝目标，锁外写 | ✓ `FT10_PublishWriteDoesNotBlockSubscribe`、✓ `NW06_SlowGatewayDoesNotBlockOthers`、✓ `FullOutboxDoesNotBlockPublisher` |
+| `connectBucket.sendLoop`、`delRelation`、`topicWebHandler` | 遍历 `topicRelevance` 里的链表时不持锁，而 `SubscribeTopic` 在 `t.mu` 下修改同一条链表 | **v0.6.0 已实现。** `sendLoop`、`delRelation`、`getConnectNum`、`topicWebHandler` 都改为在 `topicMu` 下访问链表 | ✓ `CO04_SubscribeRacesForward`，`-race -count=3` 在 Linux 和 Windows 上都通过（2026-11-11） |
+| Manager 对 Gateway 的写出 | 每个发布方连接一个 `sendLoop`，串行 `conn.Write`，没有写超时。对端主机断电时写不会立刻失败，内核缓冲写满后这个 `sendLoop` 卡住，这台 Gateway 发布的所有 Topic 都停 | **v0.6.0 已实现。** 每条接入的 Gateway 一条 4096 长的 `outbox` 和 `writeLoop`，写超时 5 秒。队列满就丢掉这一帧并计数，写失败只关闭这一台。没有 `outbox` 的连接仍直接写，现有用例不用改 | ✓ `FullOutboxDoesNotBlockPublisher`、✓ `FullOutboxIsCounted` |
+| `connectBucket.relation`、`close` | `ConnIndexTable` 在连接关闭后不删除。同一个地址再次出现时 `relation` 因为键已存在而不替换，新连接不会被索引 | **v0.6.0 已实现。** `relation` 用 `Swap` 覆盖，并关掉被换下的旧连接。`close` 用 `CompareAndDelete`，只在表里的值仍是自己时删除 | ✓ `CO05_ReplacedConnKeepsIndex` |
+| `managerIP` | 先读 `topicManage.Conn` 再调 `LocalAddr()`，重连协程会在这两步之间把连接换掉 | **v0.6.0 已实现。** 改为 `topicManage.CurrentAddr()`，空地址当错误 | ✓ `ManagerIPNilConn` |
+| 空调用 | `Publish`、`CheckTopicExist`、`GetConnectNum`、`TcpClient.Publish`、`relation` 遇到空指针会 panic。`relation` 跑在 Accept 循环里，一 panic 就不再接入新连接 | **v0.6.0 已实现。** 空值返回错误或直接返回。一条坏连接只关掉自己，Accept 循环继续 | ✓ `TestStage0`（2026-11-10 本机） |
+| `socket.Depack` | 目标队列满时返回 `nil` 和错误，调用方把它当作剩余缓冲，这次读到的后续帧和半包一起丢掉 | **v0.6.0 已实现。** 满队列只丢掉当前这一帧并计入 `DroppedFrames`，后面的帧和半包照常返回。非法长度仍拒绝整段，避免把坏长度当成半包一直攒 | ✓ `FullQueueKeepsTheFollowingBytes`、✓ `PR01_DepackDoesNotBlockWhenConsumerIsGone` |
+| `TcpClient.readLoopConn`（Gateway 侧） | 读 Manager 的 TCP 没有读超时。Manager 每 10 秒发的心跳帧在 `Read` 里被直接跳过，不用来计时。Manager 主机断电或网络中断时，Gateway 发现不了 | **v0.6.0 已实现。** 在 `conn.Read` 上设 30 秒超时（3 个 10 秒心跳）。任何字节，包括心跳，都重新计时。超时走 `onConnLost`。不用 `fireTower.toml` 的 `heartbeat` | ✓ `ReadTimeoutReplacesSilentManager` |
+| `TcpClient.dialLoop`、`waitRetry` | 断线后固定等 1 秒重连，失败后也是固定 1 秒，没有抖动。`Change_Log.md` 写的指数退避只在 `manager_client.go` 的首次连接里 | **v0.6.0 已实现。** 从 200ms 起倍增，封顶 30 秒，每次在一半到全额之间随机。`Shutdown` 在等待期间返回 | ✓ `RetryDelayIsJitteredAndCapped`、✓ `TC02_ShutdownStopsReconnect` |
+| `manager_client.go` 的 `OnPush` | `TM.centralChan <- sendMessage` 是阻塞发送。`centralChan` 满时，读 Manager 的循环停住。加上面的读超时后，这会被当成 Manager 断电，触发重连和全量重放 | **v0.6.0 已实现。** 写不进就丢这一帧，不堵住读循环 | 随读超时一起用 |
+| 重连之后 | `swapConnLocked` 只换连接。Manager 已经按旧地址 `delRelation`，Gateway 不会把本机订阅再登记一次。WebSocket 没断，客户端不知道要重订，这台机器上的用户静默收不到消息 | **v0.6.0 已实现。** `TcpClient.SetOnConnect` 在连接建立后回调。Gateway 用本机 `Topic → 人数` 表分块调用 `SubscribeTopic`。客户端不用重订 | ✓ `NW05_ReconnectReplaysSubscriptions` |
+| `SubscribeTopic`、`bindTopic` | 对同一地址每次 `num++`。超时重试或重放会让计数只增不减 | **v0.6.0 已实现。** 请求带 `Count` 和 `Version`，和 `Topic` 一一对应。版本更新才盖写，更旧的丢掉，人数为 0 即删除。字段缺失时仍是 `num++`，旧 Gateway 不用改 | ✓ `AbsoluteCountOverwritesAndIgnoresStale`；✓ `FT09_SubscribeHasDeadline` 保留 |
+| `readDispose` 的 `subscribe` 分支 | `bindTopic` 失败只调用 `fire.Error` 写日志，不通知客户端 | **v0.6.0 已实现。** `SetSubscribeFailHandler` 可选。不设置时仍只记日志，不回新帧，也不关连接 | ✓ `SubscribeFailHandler` |
+| `GetConnectNum`、`CheckTopicExist`（Gateway 侧） | 用 `context.Background()`，没有超时。示例的 `subscribeHandler` 在 `readDispose` 里调用 `GetConnectNum`，Manager 不响应时这条连接的读处理停住 | **v0.6.0 已实现。** 这两次 RPC 使用和订阅一样的 500ms 超时 | ✓ `ManagerRPCDoesNotHang` |
+| 热路径日志 | `LogLevel` 默认 `INFO`。`dispatch` 的 `message.Info("Sended")`、`readDispose` 的 `fire.Info("Extinguished")`、Manager 的 `new message` 和 `topic manager sended` 每条消息都同步打印全文。`Send` 每丢一条打一次 `WARN`，`dispatch` 每丢一条 `Printf` 一次。慢连接多的时候日志本身先成为瓶颈 | **v0.6.0 已实现。** 这几处正文每 1024 条打一条，其余只计数。`Send` 丢弃和 Bucket 丢弃每秒最多一条日志 | ✓ `HotLogIsSampled` |
 | `config/fireTower.toml` | 这份副本里 `heartbeat = 600`，读超时是 2 倍，死连接要等约 1200 秒。仓库根和示例目录的副本是 30，代码缺省也是 30 | 三处副本收敛成一份，取几十秒，具体值由故障注入确定。见「部署与配置」 | ✓ `NW02_SilentClientIsClosed` |
 | 接入进程 | 示例里升级前的身份校验是一行注释，`CheckOrigin` 恒为 `true` | 没有鉴权回调的进程不能进生产。这是接入进程的事，框架不改 | — |
 
@@ -91,10 +91,10 @@ Firetower 框架只做至多一次的路由。可靠聊天需要的消息身份�
 
 | 位置 | 现在的行为 | 改法 |
 | :--- | :--- | :--- |
-| `TowerManager.dispatch` | 每条消息送进全部分 Bucket。所有 Topic 共用 `centralChan` 和 `BuffChan`，热点把队列填满后，别的 Topic 在 `default` 分支被丢掉 | **工作区已改，未提交。** 只送给当前持有该 Topic 的 Bucket。`bucket.HotTopicMin` 大于 0 时，本桶订阅者达到这个数的 Topic 走自己的队列，默认 0 关闭。✓ `OnlyBucketsHoldingTheTopicReceive`、✓ `HotTopicSkipsTheSharedQueue` |
+| `TowerManager.dispatch` | 每条消息送进全部分 Bucket。所有 Topic 共用 `centralChan` 和 `BuffChan`，热点把队列填满后，别的 Topic 在 `default` 分支被丢掉 | **v0.6.0 已实现。** 只送给当前持有该 Topic 的 Bucket。`bucket.HotTopicMin` 大于 0 时，本桶订阅者达到这个数的 Topic 走自己的队列，默认 0 关闭。✓ `OnlyBucketsHoldingTheTopicReceive`、✓ `HotTopicSkipsTheSharedQueue` |
 | `Bucket.consumer` | 每个 Bucket 有 `ConsumerNum` 个消费者并发 `push`（`config/` 副本里是 32，另两处是 1）。大于 1 时同一条连接上的两条消息先后不定 | 框架不承诺顺序，可靠聊天靠序号重排。热点 Topic 在自己的队列里单独投递，不占共用消费者 |
-| `FireTower.Send` | `sendOut` 满即丢，没有类别，也没有提示 | **工作区已改，未提交。** 状态事件的类型是 `state`。缺失提示默认关闭，接入进程调用 `EnableGapHints` 后，丢弃业务消息会在下一次能写时发一帧 `{"type":"gap","topic":...}`。✓ `GapHintIsOffUntilEnabled` |
-| `Bucket.push` | 对该 Topic 的每条本机连接都 `Send`，没有主动 / 被动之分 | **工作区已改，未提交。** `SetPassive` 默认关闭。打开后该连接不收 `state`，业务消息照旧。✓ `PassiveSkipsStateOnly` |
+| `FireTower.Send` | `sendOut` 满即丢，没有类别，也没有提示 | **v0.6.0 已实现。** 状态事件的类型是 `state`。缺失提示默认关闭，接入进程调用 `EnableGapHints` 后，丢弃业务消息会在下一次能写时发一帧 `{"type":"gap","topic":...}`。✓ `GapHintIsOffUntilEnabled` |
+| `Bucket.push` | 对该 Topic 的每条本机连接都 `Send`，没有主动 / 被动之分 | **v0.6.0 已实现。** `SetPassive` 默认关闭。打开后该连接不收 `state`，业务消息照旧。✓ `PassiveSkipsStateOnly` |
 | `chanLens` | 当前 1000，`readIn` 和 `sendOut` 共用 | 压测后缩小。它只决定丢弃前能攒多少，不是容量 |
 | `bindTopic` | 每个客户端每次订阅都发一次 gRPC | 先不动。修完锁之后单次登记很轻。压测显示订阅 RPC 成为瓶颈时，再改成 0↔1 立即上报、人数定时同步；代价是 `GetConnectNum` 会滞后一个同步周期，示例里的在线人数广播依赖它 |
 
@@ -102,19 +102,19 @@ Firetower 框架只做至多一次的路由。可靠聊天需要的消息身份�
 
 | 位置 | 现在的行为 | 改法 |
 | :--- | :--- | :--- |
-| 路由键 | 登记用 Gateway 看到的 `LocalAddr()`，Manager 索引用自己看到的 `RemoteAddr()`。中间有地址转换时两边字符串不一致，路由表里有地址却找不到连接 | **工作区已改，未提交。** 连上后先发保留 Topic `_firetower_handshake`，键是 `ClusterId-启动随机数-连接代数`。Manager 确认后改用这个键，gRPC 的 `Ip` 也填它。没收到握手的连接仍用 `RemoteAddr()`。同一 `ClusterId` 出现两个启动随机数时打 WARN。确认超时则 Gateway 退回本地地址 | ✓ `HandshakeReplacesRemoteAddr` |
+| 路由键 | 登记用 Gateway 看到的 `LocalAddr()`，Manager 索引用自己看到的 `RemoteAddr()`。中间有地址转换时两边字符串不一致，路由表里有地址却找不到连接 | **v0.6.0 已实现。** 连上后先发保留 Topic `_firetower_handshake`，键是 `ClusterId-启动随机数-连接代数`。Manager 确认后改用这个键，gRPC 的 `Ip` 也填它。没收到握手的连接仍用 `RemoteAddr()`。同一 `ClusterId` 出现两个启动随机数时打 WARN。确认超时则 Gateway 退回本地地址 | ✓ `HandshakeReplacesRemoteAddr` |
 | Manager 进程 | 路由全在内存里，退出即空 | 保持单地址。Manager 由进程守护拉起，或者由运维切换 VIP / DNS；`dialLoop` 每次重连都会重新解析地址。恢复靠 1A 的重放。同一时刻只有一个地址，不存在「谁是主」的判定 |
-| 重放 | 1A 之后每台 Gateway 重连即重放，并每 3 分钟把整张表再盖写一次。一轮带开始和结束标记，这一轮没出现的 Topic 从该 Gateway 删掉。同一时刻只跑一轮 | **工作区已改，未提交。** 登记同时最多 8 个，多出来的排队，每秒最多一条 WARN。✓ `ReconcileDropsTopicsMissingFromTheRound`、✓ `ReplayIsOneAtATime`、✓ `RegisterWaitsWhenFull` |
-| Gateway 退出 | 没有排空。进程被杀时 WebSocket 直接断开 | **工作区已改，未提交。** `Drain` 先拒绝新的 `BuildTower`，再按批 `Close`。不调用时接入流程不变 | ✓ `DrainClosesAndRejects` |
+| 重放 | 1A 之后每台 Gateway 重连即重放，并每 3 分钟把整张表再盖写一次。一轮带开始和结束标记，这一轮没出现的 Topic 从该 Gateway 删掉。同一时刻只跑一轮 | **v0.6.0 已实现。** 登记同时最多 8 个，多出来的排队，每秒最多一条 WARN。✓ `ReconcileDropsTopicsMissingFromTheRound`、✓ `ReplayIsOneAtATime`、✓ `RegisterWaitsWhenFull` |
+| Gateway 退出 | 没有排空。进程被杀时 WebSocket 直接断开 | **v0.6.0 已实现。** `Drain` 先拒绝新的 `BuildTower`，再按批 `Close`。不调用时接入流程不变 | ✓ `DrainClosesAndRejects` |
 
 ### 阶段 3 多 Manager
 
 | 位置 | 现在的行为 | 改法 |
 | :--- | :--- | :--- |
-| `topicManage`、`topicManageGrpc` | 进程内只有一对全局变量，`GetTopicManage()` 和 `GetTopicManageGrpc()` 还是导出的 | **工作区已改，未提交。** 按地址索引的连接池。旧的 `topicServiceAddr` 和 `grpc.address` 仍是只有一台的列表。`[[manager]]` 可分别标 `register` 和 `publish`。两个导出函数签名不变，返回池里的第一台 | ✓ `OldConfigIsOneManagerAndListCanSplitRoles` |
-| 订阅 | 只登记到唯一的 Manager | **工作区已改，未提交。** 登记集合里当前连得上的每一台都盖写成功，才在本机 Bucket 留下这个连接。一台失败就整次失败，不留本地订阅 | ✓ `RegisterIsAllOrNothing` |
-| 发布 | 写进唯一的 TCP | **工作区已改，未提交。** 在发布集合里用最高随机权重选一台，不用取模。只有一台时永远是它。`wait` 只在启动预热时发出，登记进行中仍是 `ready`。有别的 `ready` Manager 时不选 `wait`；一台都不是 `ready` 时退回任意一台连得上的。换一台时 `ManagerFlaps` 加一 | ✓ `OneManagerIsAlwaysPicked`、✓ `HashStaysUntilThatManagerLeaves`、✓ `RegisterOnlyManagerDoesNotReceivePublish`、✓ `HeartbeatWaitIsNotPublishable`、✓ `OnlyWaitingManagerStillPublishes` |
-| 在线人数 | 读唯一的 Manager | **工作区已改，未提交。** `GetConnectNum` 读这一条发布会落到的那一台，人数和发布目标一致 | ✓ `GetConnectNumUsesThePublishTarget` |
+| `topicManage`、`topicManageGrpc` | 进程内只有一对全局变量，`GetTopicManage()` 和 `GetTopicManageGrpc()` 还是导出的 | **v0.6.0 已实现。** 按地址索引的连接池。旧的 `topicServiceAddr` 和 `grpc.address` 仍是只有一台的列表。`[[manager]]` 可分别标 `register` 和 `publish`。两个导出函数签名不变，返回池里的第一台 | ✓ `OldConfigIsOneManagerAndListCanSplitRoles` |
+| 订阅 | 只登记到唯一的 Manager | **v0.6.0 已实现。** 向登记集合里当前连得上的每一台盖写。Manager 明确拒绝时整次失败，不留本地订阅；超时或暂时不可用时订阅留在本机，由后台重放补齐那一台 | ✓ `RegisterIsAllOrNothing`、✓ `RegisterTimeoutKeepsSubscriptionAndReplays`、✓ `SlowManagerDoesNotLoseTheSubscription` |
+| 发布 | 写进唯一的 TCP | **v0.6.0 已实现。** 在发布集合里用最高随机权重选一台，不用取模。只有一台时永远是它。`wait` 只在启动预热时发出，登记进行中仍是 `ready`。有别的 `ready` Manager 时不选 `wait`；一台都不是 `ready` 时退回任意一台连得上的。换一台时 `ManagerFlaps` 加一 | ✓ `OneManagerIsAlwaysPicked`、✓ `HashStaysUntilThatManagerLeaves`、✓ `RegisterOnlyManagerDoesNotReceivePublish`、✓ `HeartbeatWaitIsNotPublishable`、✓ `OnlyWaitingManagerStillPublishes` |
+| 在线人数 | 读唯一的 Manager | **v0.6.0 已实现。** `GetConnectNum` 读这一条发布会落到的那一台，人数和发布目标一致 | ✓ `GetConnectNumUsesThePublishTarget` |
 | 订阅上报 | 每个客户端每次订阅发一次 gRPC。全量登记后每个 Manager 都要收一遍，加 Manager 不分摊这部分 | 1B 表最后一行的 0↔1 上报能把登记量从按用户变成按 Topic × Gateway，但它会让 `GetConnectNum` 滞后，和「不能变的部分」冲突，默认不做。不做时阶段 3 只提高发布吞吐 |
 
 每个 Manager 都有全量路由，哈希只决定发布走哪一台。这样做的原因：
@@ -123,9 +123,9 @@ Firetower 框架只做至多一次的路由。可靠聊天需要的消息身份�
 - 增减 Manager 时没有路由要迁移。新 Manager 上线后，各 Gateway 连上它并重放订阅（1A 的同一段代码）。它要等**全部** Gateway 都登记完才能接收发布，步骤见「各阶段之间的兼容」。
 - 一台 Manager 故障时，发布直接落到哈希环上的下一台，不需要等重放。
 
-`bindTopic` 要等登记集合里的每一台 Manager 都盖写成功，才在本机 Bucket 留下这个连接。其中一台超时就整次失败，不留下只在一部分 Manager 上存在的订阅；下一轮重放再补。这里的「每一台」只算当前 TCP 连得上的；连不上的那台回来时会收到整表重放。不这样限定的话，一台 Manager 故障会让所有 Gateway 上的订阅全部失败，比只有一个 Manager 时还差。退订没删掉的那一台还会把帧送过来，本机没有订阅者时丢掉并计数。
+`bindTopic` 向登记集合里的每一台 Manager 盖写。某一台明确拒绝时整次失败，不留本地订阅。某一台超时（重试 500ms、1s、2s 后仍超时）时，订阅仍留在本机，并立即安排一次对那一台的重放补齐；这样 Manager 忙时不会把用户的订阅丢掉。这里的「每一台」只算当前 TCP 连得上的；连不上的那台回来时会收到整表重放。不这样限定的话，一台 Manager 故障会让所有 Gateway 上的订阅全部失败，比只有一个 Manager 时还差。退订没删掉的那一台还会把帧送过来，本机没有订阅者时丢掉并计数。
 
-`GetConnectNum` 在登记没齐时各台数字不同。示例在 `subscribeHandler` 里用它报在线人数，阶段 3 要约定读发布集合里的哪一台，或取各台的最大值。否则同一个房间会报出两个人数。
+`GetConnectNum` 在登记没齐时各台数字不同。v0.6.0 统一读这条 Topic 发布会落到的那一台，所以同一时刻同一个房间只报一个人数。
 
 代价是路由内存和订阅 RPC 都乘以 Manager 台数。路由表是 `Topic → Gateway`，不含用户，量级是 Topic 数乘 Gateway 数。切换瞬间同一 Topic 的两条消息可能经过不同 Manager，先后不保证；框架本来就不承诺顺序。一台 Manager 抖动会改变其余 Topic 的发布落点，这个次数要单独计数：它表示有 Manager 不稳，不是该加机器。
 
@@ -133,7 +133,7 @@ Firetower 框架只做至多一次的路由。可靠聊天需要的消息身份�
 
 ### 阶段 4 热点分组
 
-**工作区已改，未提交。默认关闭。** 客户端仍订阅和发布原来的 Topic，下行仍是发布者的 `data`。接入进程调用 `SetTopicShards(topic, n)`，或在配置里写 `[[group]]` 的 `topic` 和 `shards`。`n` 小于 2 等于关闭，最大 256。
+**v0.6.0 已实现，默认关闭。** 客户端仍订阅和发布原来的 Topic，下行仍是发布者的 `data`。接入进程调用 `SetTopicShards(topic, n)`，或在配置里写 `[[group]]` 的 `topic` 和 `shards`。`n` 小于 2 等于关闭，最大 256。
 
 打开之后：
 
@@ -291,6 +291,8 @@ Manager 之间不同步，也不互相连接。每个 Manager 的数据都直接
 
 ## 部署与配置
 
+> 给运维的操作手册是 [deploy.md](deploy.md)。本节保留设计依据。
+
 ### Manager 放在哪
 
 Manager 本来就是独立进程：`example/topic_service/main.go` 起 `StartGrpcService` 和 `StartSocketService`，和 Gateway 分开编译、分开运行。要定的只是它和 Gateway 是否同机。
@@ -384,24 +386,25 @@ publish = false     # 新加入的先只登记，全部 Gateway 登记完再改�
 
 `publish` 这一项对应「各阶段之间的兼容」里增减 Manager 的两步。
 
-### 还没有配置键的参数
+### 写死在代码里的参数
 
-这些现在要么写死在代码里，要么还不存在，1A 和阶段 2 实现时一并加上：
+下面这些在 v0.6.0 里都已实现，但值写在代码里，没有配置键。运维部署见 [deploy.md](deploy.md)：
 
 | 参数 | 现状 | 所在位置 |
 | :--- | :--- | :--- |
 | Manager 对 Gateway 的心跳间隔 | 写死 10 秒，`topicmanage.toml` 里的 `heartbeat` 没有被读 | `connectBucket.heartbeat` |
 | Gateway 读 Manager 的超时 | 写死 30 秒，按 3 个 10 秒心跳 | `TcpClient.readLoopConn` |
 | Manager 写 Gateway 的超时和写队列长度 | 写超时 5 秒，`outbox` 长度 4096。`packetChan` 仍是 1024 | `connectBucket.writeLoop` |
-| Gateway 调 Manager 的 RPC 超时 | 写死 500ms。订阅、退订、`GetConnectNum`、`CheckTopicExist` 都带超时 | `managerRPCTimeout` |
+| Gateway 调 Manager 的 RPC 超时 | 500ms。订阅登记超时后按 1s、2s 再试两次，仍超时则订阅留在本机、由重放补齐；`GetConnectNum`、`CheckTopicExist` 只用 500ms | `managerRPCTimeout`、`registerTimeouts` |
 | 重连间隔和抖动 | 200ms 起倍增，封顶 30 秒，一半到全额之间随机 | `TcpClient.dialLoop`、`waitRetry` |
 | 重放分块大小、登记并发上限 | 每块 256 个 Topic，同时登记最多 8 个。整表对账每 3 分钟一次 | `census.go`、`enterRegister` |
-| 单机连接数上限和各项告警水位 | 不存在 | 「容量告警」一节 |
-| `ClusterId` | 在 `main` 里赋值 | 接入进程 |
+| 单机连接数上限和各项告警水位 | **已有配置键**：`maxConnections`（默认 100000）、`warn.connectionPercent`、`warn.queuePercent`（默认 70） | 「容量告警」一节 |
+| `ClusterId` | 仍在接入进程的 `main` 里赋值，多台 Gateway 时由接入进程从配置或环境变量读 | 接入进程 |
+| 内存保护 | **已有配置键**：`[memory] limitMB`、`softPercent`、`hardPercent`、`criticalPercent`、`shedPercent`、`disable` | 「内存保护」一节 |
 
 ## 配置与代码的分界
 
-方案里的告警水位、读写超时、重放分块大小现在都还没有配置键，要先写读取和判断的代码。
+v0.6.0 里告警水位、连接上限、内存保护有配置键；读写超时、重放分块大小写在代码里，见上一节。
 
 ### 只改现有配置
 
@@ -412,7 +415,11 @@ publish = false     # 新加入的先只登记，全部 Gateway 登记完再改�
 | `chanLens` | 每条连接的 `readIn`、`sendOut` 长度。当前 `1000` |
 | `heartbeat` | WebSocket Ping 间隔，读超时是 2 倍。副本里有 `30` 和 `600` 两种 |
 | `bucket.Num` / `CentralChanCount` / `BuffChanCount` / `ConsumerNum` | 本机分桶。`ConsumerNum` 在副本里有 `1` 和 `32` 两种 |
-| `topicServiceAddr` / `grpc.address` | 这一进程连接的唯一 Manager |
+| `topicServiceAddr` / `grpc.address` | 只有一台 Manager 时用。写了 `[[manager]]` 时这两项不生效 |
+| `[[manager]]` | 多台 Manager，每项 `name`、`tcp`、`grpc`、`register`、`publish` |
+| `[[group]]` | 大房间分片，每项 `topic`、`shards` |
+| `maxConnections`、`maxTopicsPerConn`、`maxTopicsPerFrame` | 本机连接数、每连接 Topic 数、每帧 Topic 数上限 |
+| `[warn]`、`[memory]` | 告警水位、内存保护 |
 
 多开 Gateway：每个进程一份配置，两个地址指向同一个 Manager。`gateway.ClusterId` 写在进程 `main` 里，取值 `1`～`1024`，各进程不同，只用于本地消息 id。Gateway 与 Manager 之间不能做地址转换，阶段 2 的握手键解除这个限制。
 
@@ -422,14 +429,14 @@ publish = false     # 新加入的先只登记，全部 Gateway 登记完再改�
 
 用现有回调做鉴权。用 `SetBeforeSubscribeHandler` 改写 Topic 名、在发布侧对多个 Topic 各调用一次 `Publish`，可以在业务层分组，见 `example/bucketing_demo.go`；它的代价见「阶段 4」。
 
-### 必须改框架才能实现
+### 框架里已实现的部分（v0.6.0）
 
 - **1A：** 「当前代码与改法」里 1A 表的全部条目；容量计数和 WARN。
 - **1B：** 按 Topic 选 Bucket；热点 Topic 独立队列；消息类别和缺失提示；主动 / 被动订阅标志。
 - **阶段 2：** 握手帧和新的路由键；Manager 侧登记并发上限；Gateway 排空。
 - **阶段 3：** Manager 连接池；向全部 Manager 登记；一致性哈希选发布目标。
 
-业务 `MessageID`、序号、消息日志、端上确认和补拉不在这张表里，它们不需要改框架。
+以上各项都已随 v0.6.0 发布。业务 `MessageID`、序号、消息日志、端上确认和补拉不在这张表里，它们不需要改框架。
 
 ## 容量告警
 

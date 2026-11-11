@@ -1,6 +1,6 @@
 # Firetower: 下一代高性能分布式实时推送网关白皮书
 
-> 评估扩容方案时不要使用本文。现行方案是 [docs/scale-plan.md](docs/scale-plan.md)。下文的并发人数和「已实现的端侧分片」没有对应的压测或代码。
+> 评估扩容方案时不要使用本文。现行方案是 [docs/scale-plan.md](docs/scale-plan.md)，v0.6.0 实际实现和测试结果见 [docs/architecture.md](docs/architecture.md) 与 [docs/release-test-plan.md](docs/release-test-plan.md)。下文的并发人数、PPS、主备切换和 Etcd/Consul 规划没有对应的压测或代码；v0.6.0 的房间分片是服务端分片（`[[group]]`），不是端侧分片。
 
 **版本**: 1.0.0  
 **日期**: 2026年1月  
