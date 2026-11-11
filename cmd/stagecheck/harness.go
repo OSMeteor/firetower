@@ -156,7 +156,9 @@ type cluster struct {
 	extraTables string
 	// 之后新建的 Manager 进程额外带的环境变量。
 	managerEnv []string
-	links      []*netLink
+	// 非空时替换缺省的 [bucket] 段（压测用部署手册里的值）。
+	bucket string
+	links  []*netLink
 }
 
 func newCluster(tag string) (*cluster, error) {
@@ -237,7 +239,11 @@ func (c *cluster) gatewayToml() string {
 			fmt.Fprintf(&b, "topicServiceAddr = \"127.0.0.1:%d\"\n\n[grpc]\naddress = \"127.0.0.1:%d\"\n", m.gwTCP(), m.gwGRPC())
 		}
 	}
-	b.WriteString("\n[bucket]\nNum = 4\nCentralChanCount = 8192\nBuffChanCount = 1024\nConsumerNum = 4\n")
+	if c.bucket != "" {
+		b.WriteString(c.bucket)
+	} else {
+		b.WriteString("\n[bucket]\nNum = 4\nCentralChanCount = 8192\nBuffChanCount = 1024\nConsumerNum = 4\n")
+	}
 	if !(visible == 1 && len(c.publish) == 0 && len(c.register) == 0) {
 		for _, m := range c.managers {
 			if c.hidden[m.name] {

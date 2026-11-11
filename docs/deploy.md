@@ -68,7 +68,53 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 ```
 
+Manager 跑在 Windows 上时，用 NSSM（第三方的服务包装工具，nssm.cc）注册成服务，崩溃后自动拉起：
+
+```bat
+nssm install firetower-manager C:\firetower-manager\topic_service.exe
+nssm set firetower-manager AppDirectory C:\firetower-manager
+nssm set firetower-manager AppStdout C:\firetower-manager\logs\manager.log
+nssm set firetower-manager AppStderr C:\firetower-manager\logs\manager.log
+nssm set firetower-manager AppRotateFiles 1
+nssm set firetower-manager AppRotateBytes 104857600
+nssm start firetower-manager
+```
+
+`AppDirectory` 必须是放 `topicmanage.toml` 的目录。不能装 NSSM 时，用「任务计划程序」建一个「计算机启动时」触发的任务，在「设置」里勾上「如果任务失败，重新启动」。
+
 Gateway 按业务进程原来的方式守护。如果是 Linux，文件句柄上限要大于 `maxConnections`，每条 WebSocket 占一个句柄。
+
+### 0.5 日志在哪里
+
+| 进程 | 输出到 | 怎么收 |
+| :--- | :--- | :--- |
+| Manager | 标准输出和标准错误 | systemd 下 `journalctl -u firetower-manager`；NSSM 下是上面配置的 `manager.log` |
+| Gateway（框架部分） | 业务进程的标准错误（`[FireTower] ...` 开头）和标准输出（`[manager client] ...` 开头） | 业务进程的标准输出、标准错误要被收集，**不会自动进 beego 的日志文件**。想写进业务日志，在接入代码里给 `gateway.TowerLogger` 赋一个转发到业务日志的函数 |
+
+- Gateway 缺省日志级别是 `INFO`，每条连接建立、断开都打一行。在线人数多时在接入代码里设 `gateway.LogLevel = "WARN"`，只留告警和错误（这时启动时那行 `memory guard: limit` 也不打，用 `gateway.MemoryGuardStats()` 确认上限）。
+- 第 6 节以后各场景「告警处理」里的关键字都在这些输出里，建议在日志平台上按关键字配告警。
+
+### 0.6 容量参考（单机压测结果）
+
+2026-11-11 用 `stagecheck -stage bench` 在三种环境上测过（方法见 [release-test-plan.md](release-test-plan.md)）。Manager、Gateway 和压测客户端都在同一台机器上，压测客户端自己就占 1～5 核，所以下面是**下限**，不是生产机器的上限。
+
+| 项 | Linux 云主机 2 核 8GB | Windows 8 核 16 线程 32GB | 同机 WSL2 16 核 16GB |
+| :--- | :--- | :--- | :--- |
+| 每条空闲连接的内存（Go 管理内存，`chanLens = 1000`） | 53KB | 67KB | 54KB |
+| 其中存活对象 | 33KB | 26KB | 30KB |
+| 每条连接的协程数 | 3 | 3 | 3 |
+| 1 万条连接建连并订阅完 | 约 1 秒 | 约 2 秒 | 约 1.4 秒 |
+| 一台 Gateway、2000 人的房间、每条 1KB：不丢且 p99 ≤ 1 秒的最高发送速率 | 100 条/秒，即每秒 20 万次投递，Gateway 用 1.0 核 | 100 条/秒，每秒 20 万次投递，Gateway 用 5.2 核 | 50 条/秒，每秒 10 万次投递，Gateway 用 3.2 核 |
+| 一台 Manager 转发给 8 台 Gateway、每条 1KB | 每秒 16000 帧时 Manager 用 0.10 核 | 0.49 核 | 0.61 核 |
+
+怎么用这些数：
+
+- **内存**：每条连接按 70KB 估。Gateway 进程的内存上限（`limitMB` 或机器内存）至少要 `连接数 × 70KB ÷ 0.7 + 业务自身占用`，因为到 70% 就开始拒绝新连接。例：5 万连接约需 3.5GB ÷ 0.7 = 5GB，再加业务占用。`chanLens` 每减少 100，每条连接约少 1.6KB。
+- **投递**：一台 Gateway 每秒的投递次数（每秒消息条数 × 本机订阅人数，各房间加总）按 **10～20 万次** 估。超过时加 Gateway，或降低大房间的消息频率。投递很吃 CPU：在 16 线程的机器上每秒 20 万次用了约 5 核，Gateway 的机器按这个比例留 CPU。
+- **Manager**：每秒 16000 帧只用了 0.1～0.6 核，测试里没能把它压满。Manager 一般不会先成为瓶颈，先看它的网卡出口。
+- **单条连接发布的上限**：一个 WebSocket 连接每秒最多发约 2000 条，再快会被这条连接的读写卡住。业务后端要大量推送时，用多条连接，或直接调 Manager 的 gRPC `Publish`。
+- **延迟**：没到上限时，p99 在 10～50 毫秒。
+- 正式选型前，在目标机器上跑一遍 `stagecheck -stage bench`，按实测数字算。
 
 ---
 
@@ -80,7 +126,7 @@ Gateway 按业务进程原来的方式守护。如果是 Linux，文件句柄上
 | :--- | :--- |
 | 机器 | 1 台，上面跑 Manager、Gateway 两个进程 |
 | 适合 | 开发、测试、在线人数不大的生产 |
-| 容量 | 以压测为准。框架缺省 `maxConnections = 100000`，实际能撑多少取决于业务回调、消息量和内存 |
+| 容量 | 按第 0.6 节估：每条连接约 70KB 内存；一台 Gateway 每秒 10～20 万次投递。框架缺省 `maxConnections = 100000`，按内存算出的连接数比它小时，把它调低 |
 
 ### 配置文件
 
@@ -139,6 +185,8 @@ port = 6666
 ### 检查项
 
 - [ ] Gateway 读的配置是绝对路径，内容是上面的模板；`heartbeat` 是 30，不是 600。
+- [ ] 接入代码满足三条（找开发确认）：`BuildTower` 返回 `nil` 时调用 `ws.Close()` 并返回（见 README 的接入示例）；go.mod 里 `google.golang.org/grpc` 是 v1.25 及以上；在线人数多时设了 `gateway.LogLevel = "WARN"`。
+- [ ] Gateway 进程的标准输出、标准错误有人收（第 0.5 节）。
 - [ ] Gateway 日志有 `[manager client] connected:`，没有反复出现 `tcp connect ... error`。
 - [ ] 两个进程的 `memory guard: limit` 数值合理。Gateway 和业务共用一台机器时，确认已经写了 `limitMB`。
 - [ ] 两个进程都在守护下：分别 `kill` 一次，确认能自动拉起。
@@ -194,7 +242,7 @@ Manager 的 `topicmanage.toml` 和场景 A 一样。
 ### 检查项
 
 - [ ] 场景 A 的检查项全部通过。
-- [ ] 每台 Gateway 的 `ClusterId` 不同。Manager 日志里没有 `cluster ... reported startup ... and ...`。
+- [ ] 每台 Gateway 的 `ClusterId` 不同，且是接入代码从配置或环境变量读的，不是写死的。Manager 日志里没有 `cluster ... reported startup ... and ...`。
 - [ ] Manager 单独一台机器。
 - [ ] 每台 Gateway 到 Manager 两个端口都通。
 - [ ] **演练跨机投递**：两个测试客户端分别连到两台不同的 Gateway，订阅同一个房间，一个发、另一个能收到。
@@ -358,6 +406,20 @@ shards = 8
 ### 从 v0.5.x 升级到 v0.6.x
 
 不支持新旧版本混跑。安排一个窗口，Manager 和所有 Gateway 一起换成新版本。
+
+升级前准备好回退用的东西：v0.5.x 的 Manager 程序、v0.5.x 编译的接入进程、升级前的 `fireTower.toml` 和 `topicmanage.toml`。
+
+### 回退到 v0.5.x
+
+也必须整体回退，不能只退一部分：
+
+1. 停掉所有 Gateway（用户会断开）。
+2. 停掉所有 Manager。
+3. 换回 v0.5.x 的 Manager 程序和配置，启动。v0.5.x 只支持一台 Manager，多 Manager 的部署要先改回一台。
+4. 换回 v0.5.x 编译的接入进程和升级前的配置，逐台启动 Gateway。v0.5.x 不认 `[[manager]]`、`[[group]]`、`[memory]`，配置里要改回 `topicServiceAddr` 和 `[grpc] address`。
+5. 按场景 A 或 B 的检查项检查一遍。
+
+回退后内存保护、订阅自动补回等 v0.6 的能力都没有了，Manager 重启后客户端要重连才能恢复收消息。
 
 ---
 

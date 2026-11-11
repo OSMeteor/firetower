@@ -23,11 +23,16 @@ func main() {
 		runGateway()
 		return
 	}
-	stage := flag.String("stage", "all", "2, 3, 4, net, load, opt, cfg, mem, reconcile 或 all")
+	stage := flag.String("stage", "all", "2, 3, 4, net, load, opt, cfg, mem, reconcile, all；压测用 bench（不在 all 里）")
 	gateways := flag.Int("gateways", 4, "阶段 2 的 Gateway 台数")
 	big := flag.Int("big", 20, "阶段 2 Manager 故障恢复用的 Gateway 台数，0 表示跳过")
 	flag.DurationVar(&reconcileWait, "reconcile-wait", 200*time.Second, "人数对不上时，最多等多久的定期对账")
 	keep := flag.Bool("keep", false, "结束后保留各进程的目录和日志")
+	flag.IntVar(&benchConns, "bench-conns", benchConns, "bench B1 的空闲连接数")
+	flag.IntVar(&benchSubs, "bench-subs", benchSubs, "bench B2 房间人数")
+	flag.IntVar(&benchGWs, "bench-gateways", benchGWs, "bench B3 的 Gateway 台数")
+	flag.IntVar(&benchSize, "bench-size", benchSize, "bench 每条消息正文的字节数")
+	flag.DurationVar(&benchStep, "bench-step", benchStep, "bench 每档持续时间")
 	flag.Parse()
 	start := time.Now()
 	run := func(name string, fn func(keep bool)) {
@@ -49,6 +54,11 @@ func main() {
 	run("mem", stageMemory)
 	run("mem", stageManagerMemory)
 	run("reconcile", stageReconcile)
+	if *stage == "bench" {
+		// 压测不在 all 里：耗时长，结果取决于机器。
+		fmt.Printf("\n===== 阶段 bench =====\n")
+		stageBench(*keep)
+	}
 
 	fmt.Printf("\n===== 汇总 =====\n通过 %d，失败 %d，用时 %s\n", rep.passed, rep.failed, time.Since(start).Round(time.Second))
 	if rep.failed > 0 {

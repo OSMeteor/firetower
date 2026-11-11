@@ -35,6 +35,7 @@ func runManager() {
 			metrics.Read(s)
 			fmt.Fprintf(w, "%d %d %d", s[0].Value.Uint64(), manager.MemoryGuardDropped(), manager.MemoryGuardLimit())
 		})
+		mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, procStats()) })
 		go func() { _ = http.ListenAndServe(addr, mux) }()
 	}
 	m := &manager.Manager{}
@@ -148,6 +149,7 @@ func runGateway() {
 		limit, live, heap, rejecting, closed, trimmed := gateway.MemoryGuardStats()
 		fmt.Fprintf(w, "%d %d %d %t %d %d", limit, live, heap, rejecting, closed, trimmed)
 	})
+	http.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) { fmt.Fprint(w, procStats()) })
 	http.HandleFunc("/goroutines", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "%d", runtime.NumGoroutine())
 	})
@@ -161,4 +163,35 @@ func runGateway() {
 		fmt.Println("http:", err)
 		os.Exit(2)
 	}
+}
+
+// procStats 给压测用：存活堆、Go 管理的全部内存、协程数、本进程用掉的 CPU 秒数。
+// 只读运行时指标，不触发 GC，也不暂停程序。
+func procStats() string {
+	s := []metrics.Sample{
+		{Name: "/gc/heap/live:bytes"},
+		{Name: "/memory/classes/total:bytes"},
+		{Name: "/cpu/classes/user:cpu-seconds"},
+		{Name: "/cpu/classes/gc/total:cpu-seconds"},
+		{Name: "/cpu/classes/scavenge/total:cpu-seconds"},
+	}
+	metrics.Read(s)
+	u := func(i int) uint64 {
+		if s[i].Value.Kind() == metrics.KindUint64 {
+			return s[i].Value.Uint64()
+		}
+		return 0
+	}
+	f := func(i int) float64 {
+		if s[i].Value.Kind() == metrics.KindFloat64 {
+			return s[i].Value.Float64()
+		}
+		return 0
+	}
+	cpu := osCPUSeconds()
+	if cpu < 0 {
+		// 拿不到操作系统的数时退回 Go 运行时的估算，它在网络等待多时会偏高。
+		cpu = f(2) + f(3) + f(4)
+	}
+	return fmt.Sprintf("%d %d %d %.3f", u(0), u(1), runtime.NumGoroutine(), cpu)
 }
